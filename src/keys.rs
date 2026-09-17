@@ -397,7 +397,7 @@ impl FullViewingKey {
     pub fn scope_for_address(&self, address: &Address) -> Option<Scope> {
         [Scope::External, Scope::Internal]
             .into_iter()
-            .find(|scope| self.to_ivk(*scope).diversifier_index(address).is_some())
+            .find(|scope| &self.address(address.diversifier(), *scope) == address)
     }
 
     /// Serializes the full viewing key as specified in [Zcash Protocol Spec § 5.6.4.4: Orchard Raw Full Viewing Keys][orchardrawfullviewingkeys]
@@ -930,7 +930,16 @@ impl SharedSecret {
 pub mod testing {
     use proptest::prelude::*;
 
-    use super::{DiversifierIndex, DiversifierKey, EphemeralSecretKey, SpendingKey};
+    use super::{Diversifier, DiversifierIndex, DiversifierKey, EphemeralSecretKey, SpendingKey};
+
+    prop_compose! {
+        /// Generate a uniformly distributed Orchard diversifier.
+        pub(crate) fn arb_diversifier()(
+            d_bytes in prop::array::uniform11(prop::num::u8::ANY)
+        ) -> Diversifier {
+            Diversifier::from_bytes(d_bytes)
+        }
+    }
 
     prop_compose! {
         /// Generate a uniformly distributed Orchard spending key.
@@ -985,7 +994,9 @@ mod tests {
     use proptest::prelude::*;
 
     use super::{
-        testing::{arb_diversifier_index, arb_diversifier_key, arb_esk, arb_spending_key},
+        testing::{
+            arb_diversifier, arb_diversifier_index, arb_diversifier_key, arb_esk, arb_spending_key,
+        },
         *,
     };
     use crate::{
@@ -993,6 +1004,35 @@ mod tests {
         value::NoteValue,
         Note,
     };
+
+    /// Every address scope, in the order `FullViewingKey::scope_for_address` examines them.
+    ///
+    /// The exhaustive `match` turns a new `zip32::Scope` variant into a compile error here, so
+    /// the differential tests cannot silently omit it.
+    fn all_scopes() -> [Scope; 2] {
+        let scopes = [Scope::External, Scope::Internal];
+        for scope in scopes {
+            match scope {
+                Scope::External | Scope::Internal => {}
+            }
+        }
+        scopes
+    }
+
+    /// Frozen copy of the former `FullViewingKey::scope_for_address` algorithm from
+    /// Orchard base `ae3511076ec8ecb39ffc02d9cdaf19c441c5b53d`, used only as a
+    /// differential-test oracle.
+    ///
+    /// This must retain the former index-recovery algorithm and must not call the new
+    /// production classifier, or the differential tests would compare it with itself.
+    fn scope_for_address_via_index_recovery(
+        fvk: &FullViewingKey,
+        address: &Address,
+    ) -> Option<Scope> {
+        all_scopes()
+            .into_iter()
+            .find(|scope| fvk.to_ivk(*scope).diversifier_index(address).is_some())
+    }
 
     #[test]
     fn spend_validating_key_from_bytes() {
@@ -1036,6 +1076,66 @@ mod tests {
         ) {
             let d = dk.get(j);
             assert_eq!(j, dk.diversifier_index(&d));
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(16))]
+
+        #[test]
+        fn scope_for_address_matches_index_recovery_at_boundary_indices(
+            sk in arb_spending_key(),
+        ) {
+            let fvk = FullViewingKey::from(&sk);
+            let boundary_indices = [
+                DiversifierIndex::new(),
+                DiversifierIndex::from(1u32),
+                DiversifierIndex::from([u8::MAX; 11]),
+            ];
+
+            for scope in all_scopes() {
+                for diversifier_index in boundary_indices {
+                    let address = fvk.address_at(diversifier_index, scope);
+                    let recovered_scope = scope_for_address_via_index_recovery(&fvk, &address);
+
+                    prop_assert_eq!(recovered_scope, Some(scope));
+                    prop_assert_eq!(fvk.scope_for_address(&address), recovered_scope);
+                }
+            }
+        }
+
+        #[test]
+        fn scope_for_address_matches_index_recovery_for_arbitrary_diversifiers(
+            sk in arb_spending_key(),
+            diversifier in arb_diversifier(),
+        ) {
+            let fvk = FullViewingKey::from(&sk);
+
+            for scope in all_scopes() {
+                let address = fvk.address(diversifier, scope);
+                let recovered_scope = scope_for_address_via_index_recovery(&fvk, &address);
+
+                prop_assert_eq!(recovered_scope, Some(scope));
+                prop_assert_eq!(fvk.scope_for_address(&address), recovered_scope);
+            }
+        }
+
+        #[test]
+        fn scope_for_address_matches_index_recovery_for_non_owned_addresses(
+            sk in arb_spending_key(),
+            address_sk in arb_spending_key(),
+            diversifier in arb_diversifier(),
+        ) {
+            let fvk = FullViewingKey::from(&sk);
+            let address_fvk = FullViewingKey::from(&address_sk);
+
+            for scope in all_scopes() {
+                let address = address_fvk.address(diversifier, scope);
+                let recovered_scope = scope_for_address_via_index_recovery(&fvk, &address);
+
+                prop_assert_eq!(recovered_scope, None);
+                prop_assert_eq!(fvk.scope_for_address(&address), recovered_scope);
+            }
         }
     }
 

@@ -7,6 +7,12 @@ and this project adheres to Rust's notion of
 
 ## [Unreleased]
 
+### Changed
+- `orchard::keys::FullViewingKey::scope_for_address` now reconstructs the candidate
+  address directly from the address's diversifier for each scope instead of recovering
+  and re-encrypting the diversifier index. The result is unchanged; the FF1 index
+  recovery is no longer on this call path.
+
 ## [0.15.3] - 2026-07-22
 
 ### Changed
