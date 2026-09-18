@@ -293,6 +293,34 @@ impl Note {
         CtOption::new(note, note.commitment_inner().is_some())
     }
 
+    /// Creates a `Note` from its component parts, returning both the note and
+    /// its [`NoteCommitment`] from a *single* Sinsemilla derivation.
+    ///
+    /// DEDUP LEVER 1: `from_parts` computes the commitment internally only to
+    /// check constructibility and then throws it away, so callers that also
+    /// need the commitment (`verify_note_commitment`, nullifier derivation)
+    /// pay for a second identical Sinsemilla evaluation. This variant returns
+    /// the commitment that was already computed, so the caller derives the
+    /// note commitment exactly once.
+    pub fn from_parts_with_commitment(
+        recipient: Address,
+        value: NoteValue,
+        rho: Rho,
+        rseed: RandomSeed,
+        version: NoteVersion,
+    ) -> Option<(Self, NoteCommitment)> {
+        let note = Note {
+            recipient,
+            value,
+            rho,
+            rseed,
+            version,
+        };
+        // Compute the commitment exactly once and hand it back to the caller.
+        let cm = Option::<NoteCommitment>::from(note.commitment_inner())?;
+        Some((note, cm))
+    }
+
     /// Generates a new note.
     ///
     /// Defined in [Zcash Protocol Spec § 4.7.3: Sending Notes (Orchard)][orchardsend].
@@ -437,6 +465,21 @@ impl Note {
     /// Derives the nullifier for this note.
     pub fn nullifier(&self, fvk: &FullViewingKey) -> Nullifier {
         Nullifier::derive(fvk.nk(), self.rho.0, self.psi(), self.commitment())
+    }
+
+    /// Derives the nullifier for this note, reusing an already-computed
+    /// [`NoteCommitment`] instead of recomputing it (DEDUP LEVER 1).
+    ///
+    /// The caller is responsible for passing the commitment of *this* note
+    /// (e.g. the value returned alongside it by
+    /// [`Note::from_parts_with_commitment`]); nullifier derivation binds the
+    /// commitment, so an incorrect `cm` would produce an incorrect nullifier.
+    pub fn nullifier_with_commitment(
+        &self,
+        fvk: &FullViewingKey,
+        cm: &NoteCommitment,
+    ) -> Nullifier {
+        Nullifier::derive(fvk.nk(), self.rho.0, self.psi(), cm.clone())
     }
 }
 

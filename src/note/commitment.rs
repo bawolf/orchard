@@ -58,7 +58,14 @@ impl NoteCommitment {
         psi: pallas::Base,
         rcm: NoteCommitTrapdoor,
     ) -> CtOption<Self> {
-        let domain = sinsemilla::CommitDomain::new(NOTE_COMMITMENT_PERSONALIZATION);
+        // DEDUP LEVER 2: cache the `CommitDomain` (and its Sinsemilla `Q`/`R`
+        // generators) once for the whole process instead of rebuilding it on
+        // every `derive` call. The generators depend only on the fixed
+        // NoteCommit personalization, so this is a pure memoization with no
+        // change to the committed value. On the device this removes the ~2.9x
+        // per-call `CommitDomain::new` reconstruction multiplier (two
+        // `hash_to_curve`/SWU maps per rebuild under computed generators).
+        let domain = note_commit_domain();
         domain
             .commit(
                 iter::empty()
@@ -71,6 +78,24 @@ impl NoteCommitment {
             )
             .map(NoteCommitment)
     }
+}
+
+/// Process-wide cached `CommitDomain` for `NoteCommit^Orchard` (DEDUP LEVER 2).
+///
+/// `sinsemilla::CommitDomain::new` re-derives the domain's `Q` (via
+/// `HashDomain::new`) and `R` generators from the personalization string on
+/// every call. Those generators are constants, so we build the domain lazily
+/// once and reuse the reference. `OnceBox` is `no_std`+`alloc` compatible, so
+/// this compiles for firmware as well as the host proof.
+fn note_commit_domain() -> &'static sinsemilla::CommitDomain {
+    use alloc::boxed::Box;
+    use once_cell::race::OnceBox;
+    static DOMAIN: OnceBox<sinsemilla::CommitDomain> = OnceBox::new();
+    DOMAIN.get_or_init(|| {
+        Box::new(sinsemilla::CommitDomain::new(
+            NOTE_COMMITMENT_PERSONALIZATION,
+        ))
+    })
 }
 
 /// The x-coordinate of the commitment to a note.

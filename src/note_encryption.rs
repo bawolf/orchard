@@ -75,6 +75,214 @@ where
     Some((note, recipient))
 }
 
+// ============================================================================
+// DEDUP LEVER 1: device-local output recovery bound to an already-validated
+// `Note`, WITHOUT re-deriving the note commitment (`cmstar`).
+//
+// The stock `zcash_note_encryption::try_output_recovery_with_*` functions each
+// re-derive the note commitment twice per call:
+//   1. `parse_note_plaintext_without_memo` -> `Note::from_parts`
+//      (constructibility check: one Sinsemilla NoteCommit), and
+//   2. `check_note_validity` -> `D::cmstar(note)`
+//      (binding check: a second identical Sinsemilla NoteCommit).
+// With three recovery calls per action (pkd_esk / ock / ovk) that is six
+// redundant NoteCommit evaluations, on top of the one the engine already does
+// in `verify_note_commitment`.
+//
+// During Ironwood bundle verification the engine has ALREADY validated the
+// output note against the action's `cmx` (via `verify_note_commitment`, which
+// derives `cmx` exactly once). So the only thing output recovery still needs
+// to establish is that the ciphertext decrypts to *that same note* and that
+// the ZIP-212 ephemeral-key checks hold. We can prove "decrypts to that same
+// note" by comparing the decrypted plaintext fields to the already-validated
+// `Note` field-by-field, instead of hashing them back into a commitment.
+//
+// SECURITY EQUIVALENCE: the note commitment is a binding commitment to exactly
+// (g_d, pk_d, v, rho, psi(rseed,rho)). `rho` is fixed by the action. The
+// diversifier determines `g_d`. Therefore equality of (version, diversifier,
+// pk_d, value, rseed) between the decrypted plaintext and the already-validated
+// note implies the reconstructed note is byte-identical, hence has the same
+// commitment, hence `cmstar(reconstructed) == cmstar(validated) == action.cmx`.
+// This is exactly the property `check_note_validity` establishes, so the check
+// is NOT weakened — it is the same binding, computed by comparison instead of
+// re-hashing. The ZIP-212 `esk`/`epk` checks (scalar-mult / hash-to-curve, not
+// Sinsemilla) are preserved verbatim.
+// ============================================================================
+
+use chacha20poly1305::{aead::AeadInPlace, ChaCha20Poly1305, KeyInit};
+use subtle::ConstantTimeEq;
+use zcash_note_encryption::OUT_CIPHERTEXT_SIZE;
+
+/// Decrypts `output`'s note ciphertext with the shared secret derived from
+/// (`pk_d`, `esk`), then BINDS the decrypted plaintext to the already-validated
+/// `expected` note by field comparison (no `cmstar` recomputation). Returns the
+/// recovered memo on success. See the module-level DEDUP LEVER 1 note.
+fn recover_bound_inner<P, Output>(
+    domain: &NoteEncryptionDomain<P>,
+    pk_d: DiversifiedTransmissionKey,
+    esk: EphemeralSecretKey,
+    output: &Output,
+    expected: &Note,
+) -> Option<[u8; 512]>
+where
+    P: DomainVersion,
+    Output: ShieldedOutput<NoteEncryptionDomain<P>, ENC_CIPHERTEXT_SIZE>,
+{
+    let ephemeral_key = output.ephemeral_key();
+    let shared_secret = <NoteEncryptionDomain<P> as Domain>::ka_agree_enc(&esk, &pk_d);
+    let key = <NoteEncryptionDomain<P> as Domain>::kdf(shared_secret, &ephemeral_key);
+
+    let enc_ciphertext = output.enc_ciphertext();
+    let mut plaintext = [0u8; NOTE_PLAINTEXT_SIZE];
+    plaintext.copy_from_slice(&enc_ciphertext[..NOTE_PLAINTEXT_SIZE]);
+
+    // AEAD authentication failure => reject (identical to the stock path).
+    ChaCha20Poly1305::new(key.as_ref().into())
+        .decrypt_in_place_detached(
+            [0u8; 12][..].into(),
+            &[],
+            &mut plaintext,
+            enc_ciphertext[NOTE_PLAINTEXT_SIZE..].into(),
+        )
+        .ok()?;
+
+    // --- Bind the decrypted plaintext to the already-validated note. ---
+    //
+    // MUST-FIX #1 (Fable review): the binding must not rest on the caller having
+    // built `expected` from the *same* action. `rho` is the one NoteCommit input
+    // that never appears in the plaintext (upstream takes it from `domain.rho`),
+    // and the accepted note version is a property of the *domain*, not of
+    // `expected`. So both are now enforced against `domain` inside this function,
+    // exactly as `zcash_note_encryption` does, at zero extra Sinsemilla cost.
+    //
+    // (rho) the domain's rho (= Rho::from_nf_old(action.spend().nullifier)) must
+    //       match the validated note's rho. Together with the field checks below
+    //       this pins every free input of NoteCommit to the action's `cmx`.
+    if domain.rho != expected.rho() {
+        return None;
+    }
+    // (a) plaintext version lead byte, filtered through the *domain* policy
+    //     (upstream's `domain.policy.note_version(plaintext)`), then required to
+    //     equal the validated note's version.
+    let plaintext_version = domain.policy.note_version(&plaintext)?;
+    if plaintext_version != expected.version() {
+        return None;
+    }
+    // (b) diversifier (determines g_d).
+    let diversifier = Diversifier::from_bytes(plaintext[1..12].try_into().unwrap());
+    if diversifier != expected.recipient().diversifier() {
+        return None;
+    }
+    // (c) value.
+    let value = NoteValue::from_bytes(plaintext[12..20].try_into().unwrap());
+    if value != expected.value() {
+        return None;
+    }
+    // (d) rseed (determines psi and rcm).
+    if plaintext[20..COMPACT_NOTE_SIZE] != expected.rseed().as_bytes()[..] {
+        return None;
+    }
+    // (e) transmission key binding: the pk_d that keyed decryption (for the
+    //     pkd_esk path) or that was recovered from the outgoing ciphertext (for
+    //     the ock/ovk paths) must match the validated recipient.
+    if &pk_d != expected.recipient().pk_d() {
+        return None;
+    }
+
+    // --- ZIP-212 ephemeral-key checks (preserved verbatim; no Sinsemilla). ---
+    let derived_esk = <NoteEncryptionDomain<P> as Domain>::derive_esk(expected)?;
+    if bool::from(!derived_esk.ct_eq(&esk)) {
+        return None;
+    }
+    if !bool::from(
+        <NoteEncryptionDomain<P> as Domain>::epk_bytes(
+            &<NoteEncryptionDomain<P> as Domain>::ka_derive_public(expected, &derived_esk),
+        )
+        .ct_eq(&ephemeral_key),
+    ) {
+        return None;
+    }
+
+    let memo: [u8; 512] = plaintext[COMPACT_NOTE_SIZE..NOTE_PLAINTEXT_SIZE]
+        .try_into()
+        .unwrap();
+    Some(memo)
+}
+
+/// Device-local equivalent of `try_output_recovery_with_pkd_esk`, bound to an
+/// already-validated note (no `cmstar` recomputation). Returns the memo.
+///
+/// Takes the concrete [`NoteEncryptionDomain`] (not a generic `Domain`) so that
+/// the note's `rho` and accepted version are checked against the *domain* (i.e.
+/// the action), per MUST-FIX #1.
+pub fn recover_output_bound_with_pkd_esk<P, Output>(
+    domain: &NoteEncryptionDomain<P>,
+    pk_d: DiversifiedTransmissionKey,
+    esk: EphemeralSecretKey,
+    output: &Output,
+    expected: &Note,
+) -> Option<[u8; 512]>
+where
+    P: DomainVersion,
+    Output: ShieldedOutput<NoteEncryptionDomain<P>, ENC_CIPHERTEXT_SIZE>,
+{
+    recover_bound_inner::<P, Output>(domain, pk_d, esk, output, expected)
+}
+
+/// Device-local equivalent of `try_output_recovery_with_ock`, bound to an
+/// already-validated note (no `cmstar` recomputation). Returns the memo.
+pub fn recover_output_bound_with_ock<P, Output>(
+    domain: &NoteEncryptionDomain<P>,
+    ock: &OutgoingCipherKey,
+    output: &Output,
+    out_ciphertext: &[u8; OUT_CIPHERTEXT_SIZE],
+    expected: &Note,
+) -> Option<[u8; 512]>
+where
+    P: DomainVersion,
+    Output: ShieldedOutput<NoteEncryptionDomain<P>, ENC_CIPHERTEXT_SIZE>,
+{
+    let mut op = OutPlaintextBytes([0; OUT_PLAINTEXT_SIZE]);
+    op.0.copy_from_slice(&out_ciphertext[..OUT_PLAINTEXT_SIZE]);
+
+    ChaCha20Poly1305::new(ock.as_ref().into())
+        .decrypt_in_place_detached(
+            [0u8; 12][..].into(),
+            &[],
+            &mut op.0,
+            out_ciphertext[OUT_PLAINTEXT_SIZE..].into(),
+        )
+        .ok()?;
+
+    let pk_d = <NoteEncryptionDomain<P> as Domain>::extract_pk_d(&op)?;
+    let esk = <NoteEncryptionDomain<P> as Domain>::extract_esk(&op)?;
+
+    recover_bound_inner::<P, Output>(domain, pk_d, esk, output, expected)
+}
+
+/// Device-local equivalent of `try_output_recovery_with_ovk`, bound to an
+/// already-validated note (no `cmstar` recomputation). Returns the memo.
+pub fn recover_output_bound_with_ovk<P, Output>(
+    domain: &NoteEncryptionDomain<P>,
+    ovk: &OutgoingViewingKey,
+    output: &Output,
+    cv: &ValueCommitment,
+    out_ciphertext: &[u8; OUT_CIPHERTEXT_SIZE],
+    expected: &Note,
+) -> Option<[u8; 512]>
+where
+    P: DomainVersion,
+    Output: ShieldedOutput<NoteEncryptionDomain<P>, ENC_CIPHERTEXT_SIZE>,
+{
+    let ock = <NoteEncryptionDomain<P> as Domain>::derive_ock(
+        ovk,
+        cv,
+        &output.cmstar_bytes(),
+        &output.ephemeral_key(),
+    );
+    recover_output_bound_with_ock::<P, Output>(domain, &ock, output, out_ciphertext, expected)
+}
+
 mod sealed {
     /// Marker trait that prevents external `DomainVersion` implementations.
     pub trait Sealed {}
@@ -806,6 +1014,432 @@ mod tests {
         assert_eq!(
             try_compact_note_decryption(&domain, &ivk, &compact),
             Some((note, recipient))
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // DEDUP PROOF: builds a full Ironwood V3 action retaining every field the
+    // engine needs, so we can model both the stock and the deduped per-action
+    // verification paths and count Sinsemilla `hash_to_point` evaluations.
+    // ---------------------------------------------------------------------
+    struct FullAction {
+        fvk: crate::keys::FullViewingKey,
+        action: Action<()>,
+        note: Note,
+        recipient: Address,
+        memo: [u8; 512],
+        ovk: OutgoingViewingKey,
+        cv_net: ValueCommitment,
+        out_ct: [u8; 80],
+        epk: EphemeralKeyBytes,
+        ock: super::OutgoingCipherKey,
+    }
+
+    fn full_v3_action() -> FullAction {
+        use crate::keys::FullViewingKey;
+        let mut rng = OsRng;
+        let sk = SpendingKey::random(&mut rng);
+        let fvk = FullViewingKey::from(&sk);
+        let ovk = fvk.to_ovk(Scope::External);
+        let recipient = fvk.address_at(0u32, Scope::External);
+        let nf_old = Nullifier::dummy(&mut rng);
+        let rho = Rho::from_nf_old(nf_old);
+        let note = Note::new(
+            recipient,
+            NoteValue::from_raw(5),
+            rho,
+            NoteVersion::V3,
+            &mut rng,
+        );
+        let memo = [0u8; 512];
+        let cv_net = ValueCommitment::derive(ValueSum::from_raw(5), ValueCommitTrapdoor::zero());
+        let cmx = ExtractedNoteCommitment::from(note.commitment());
+        let encryptor = IronwoodNoteEncryption::new(Some(ovk.clone()), note, memo);
+        let epk = IronwoodDomain::epk_bytes(encryptor.epk());
+        let enc_ct = encryptor.encrypt_note_plaintext();
+        let out_ct = encryptor.encrypt_outgoing_plaintext(&cv_net, &cmx, &mut rng);
+        let encrypted_note = TransmittedNoteCiphertext {
+            epk_bytes: epk.0,
+            enc_ciphertext: enc_ct,
+            out_ciphertext: out_ct,
+        };
+        let action = Action::from_parts(
+            nf_old,
+            redpallas::VerificationKey::dummy(),
+            cmx,
+            encrypted_note,
+            cv_net.clone(),
+            (),
+        )
+        .unwrap();
+        let ock = prf_ock_orchard(&ovk, &cv_net, &cmx.to_bytes(), &epk);
+        FullAction {
+            fvk,
+            action,
+            note,
+            recipient,
+            memo,
+            ovk,
+            cv_net,
+            out_ct,
+            epk,
+            ock,
+        }
+    }
+
+    #[test]
+    fn sinsemilla_call_count_per_action_baseline() {
+        // Stock per-action verification path (no dedup), measured with the same
+        // instrumented Sinsemilla in the same tree, to establish the BEFORE count.
+        // Must be run isolated (`--test-threads=1`, single filter) because the
+        // counters are process-global atomics.
+        use zcash_note_encryption::{
+            try_output_recovery_with_ock, try_output_recovery_with_pkd_esk,
+        };
+        fn dump(label: &str, before: sinsemilla::SinsemillaCounters) {
+            let a = sinsemilla::counters_snapshot();
+            std::println!(
+                "COUNT[{}]: htp_calls={} htp_chunks={} commit={} short_commit={} commitdomain_new={} hashdomain_new={}",
+                label,
+                a.htp_calls - before.htp_calls,
+                a.htp_chunks - before.htp_chunks,
+                a.commit_calls - before.commit_calls,
+                a.shortcommit_calls - before.shortcommit_calls,
+                a.commitdomain_new - before.commitdomain_new,
+                a.hashdomain_new - before.hashdomain_new,
+            );
+        }
+        let fa = full_v3_action();
+        let fvk = &fa.fvk;
+        let action = &fa.action;
+        let recipient = fa.recipient;
+        let rho = Rho::from_nf_old(*action.nullifier());
+        let value = fa.note.value();
+        let rseed = fa.note.rseed().clone();
+        let cmx = *action.cmx();
+        let domain = IronwoodDomain::for_action(action);
+        let pk_d = IronwoodDomain::get_pk_d(&fa.note);
+        let esk = IronwoodDomain::derive_esk(&fa.note).unwrap();
+        let out_ct = fa.out_ct;
+
+        let before_action = sinsemilla::counters_snapshot();
+        {
+            // verify_nullifier
+            let ns =
+                Note::from_parts(recipient, value, rho, rseed.clone(), NoteVersion::V3).unwrap();
+            let _ = fvk.scope_for_address(&ns.recipient());
+            let _ = ns.nullifier(fvk);
+            // verify_note_commitment
+            let n0 =
+                Note::from_parts(recipient, value, rho, rseed.clone(), NoteVersion::V3).unwrap();
+            let _ = ExtractedNoteCommitment::from(n0.commitment()) == cmx;
+            // scope_for_address(recipient) in verify_bundle
+            let _ = fvk.scope_for_address(&recipient);
+            // verify_encryption (STOCK engine wiring: recover + Note::eq checks).
+            // The stock engine rebuilds the note, recovers via pkd_esk, then
+            // compares the recovered note/tuple for equality with `==`. Because
+            // `impl PartialEq for Note` recomputes BOTH commitments (note.rs),
+            // each `==` is 2 NoteCommits — the omission that made the prior
+            // baseline read 13 instead of the true ~19 (Fable review #7).
+            let en =
+                Note::from_parts(recipient, value, rho, rseed.clone(), NoteVersion::V3).unwrap();
+            let recovered = try_output_recovery_with_pkd_esk(&domain, pk_d, esk, action).unwrap();
+            let _ = recovered.0 == en && recovered.1 == en.recipient(); // Note::eq: 2 NoteCommit
+            let r_ock = try_output_recovery_with_ock(&domain, &fa.ock, action, &out_ct);
+            let _ = r_ock.is_some_and(|r| r == recovered); // tuple eq -> Note::eq: 2 NoteCommit
+            let r_ovk = try_output_recovery_with_ovk(&domain, &fa.ovk, action, &fa.cv_net, &out_ct);
+            let _ = r_ovk.is_some_and(|r| r == recovered); // tuple eq -> Note::eq: 2 NoteCommit
+        }
+        dump(
+            "WHOLE_PER_ACTION_BASELINE (stock path, engine eq checks)",
+            before_action,
+        );
+    }
+
+    #[test]
+    fn sinsemilla_call_count_per_action_deduped() {
+        use super::{
+            recover_output_bound_with_ock, recover_output_bound_with_ovk,
+            recover_output_bound_with_pkd_esk,
+        };
+
+        fn dump(label: &str, before: sinsemilla::SinsemillaCounters) {
+            let a = sinsemilla::counters_snapshot();
+            std::println!(
+                "COUNT[{}]: htp_calls={} htp_chunks={} commit={} short_commit={} commitdomain_new={} hashdomain_new={}",
+                label,
+                a.htp_calls - before.htp_calls,
+                a.htp_chunks - before.htp_chunks,
+                a.commit_calls - before.commit_calls,
+                a.shortcommit_calls - before.shortcommit_calls,
+                a.commitdomain_new - before.commitdomain_new,
+                a.hashdomain_new - before.hashdomain_new,
+            );
+        }
+
+        let fa = full_v3_action();
+        let fvk = &fa.fvk;
+        let action = &fa.action;
+        let recipient = fa.recipient;
+        let rho = Rho::from_nf_old(*action.nullifier());
+        let value = fa.note.value();
+        let rseed = fa.note.rseed().clone();
+        let cmx_expected = *action.cmx();
+
+        let domain = IronwoodDomain::for_action(action);
+        let pk_d = IronwoodDomain::get_pk_d(&fa.note);
+        let esk = IronwoodDomain::derive_esk(&fa.note).unwrap();
+        let out_ct = fa.out_ct;
+
+        // ---- SESSION PHASE (amortized, once per bundle): cache ivk ----
+        let session_before = sinsemilla::counters_snapshot();
+        let classifier = fvk.scope_classifier();
+        dump(
+            "SESSION scope_classifier (cached ivk, once per bundle)",
+            session_before,
+        );
+
+        // ---- DEDUPED WHOLE PER ACTION ----
+        let before_action = sinsemilla::counters_snapshot();
+        {
+            // verify_nullifier: build spend note + cm_old ONCE, reuse for nullifier.
+            let b = sinsemilla::counters_snapshot();
+            let (spend_note, cm_old) = Note::from_parts_with_commitment(
+                recipient,
+                value,
+                rho,
+                rseed.clone(),
+                NoteVersion::V3,
+            )
+            .unwrap();
+            dump("  step verify_nullifier from_parts_with_commitment", b);
+            let b = sinsemilla::counters_snapshot();
+            let _scope = classifier.scope_for_address(&spend_note.recipient()); // cached ivk: 0 Sinsemilla
+            dump("  step scope_for_address(spend)", b);
+            let b = sinsemilla::counters_snapshot();
+            let _nf = spend_note.nullifier_with_commitment(fvk, &cm_old); // reuse cm_old: 0 Sinsemilla
+            dump("  step nullifier_with_commitment", b);
+
+            // verify_note_commitment: build output note + cmx ONCE, compare.
+            let b = sinsemilla::counters_snapshot();
+            let (out_note, cm) = Note::from_parts_with_commitment(
+                recipient,
+                value,
+                rho,
+                rseed.clone(),
+                NoteVersion::V3,
+            )
+            .unwrap();
+            dump(
+                "  step verify_note_commitment from_parts_with_commitment",
+                b,
+            );
+            let cmx = ExtractedNoteCommitment::from(cm);
+            assert_eq!(cmx, cmx_expected, "verify_note_commitment must still hold");
+
+            // scope_for_address(recipient) in verify_bundle: cached ivk, 0 Sinsemilla.
+            let _rscope = classifier.scope_for_address(&recipient);
+
+            // verify_encryption: device-local recovery bound to `out_note`, 0 Sinsemilla.
+            let b = sinsemilla::counters_snapshot();
+            let m1 = recover_output_bound_with_pkd_esk(&domain, pk_d, esk, action, &out_note)
+                .expect("pkd_esk recovery must accept");
+            dump("  step recover pkd_esk", b);
+            let b = sinsemilla::counters_snapshot();
+            let m2 = recover_output_bound_with_ock(&domain, &fa.ock, action, &out_ct, &out_note)
+                .expect("ock recovery must accept");
+            dump("  step recover ock", b);
+            let b = sinsemilla::counters_snapshot();
+            let m3 = recover_output_bound_with_ovk(
+                &domain, &fa.ovk, action, &fa.cv_net, &out_ct, &out_note,
+            )
+            .expect("ovk recovery must accept");
+            dump("  step recover ovk", b);
+            assert_eq!(m1, fa.memo);
+            assert_eq!(m2, fa.memo);
+            assert_eq!(m3, fa.memo);
+        }
+        dump(
+            "WHOLE_PER_ACTION_DEDUPED (2 NoteCommit: cm_old + cmx; 0 CommitIvk)",
+            before_action,
+        );
+
+        // Hard assertions: exactly 2 hash_to_point evals, 0 short-commit per action.
+        let after = sinsemilla::counters_snapshot();
+        let htp = after.htp_calls - before_action.htp_calls;
+        let sc = after.shortcommit_calls - before_action.shortcommit_calls;
+        let cdn = after.commitdomain_new - before_action.commitdomain_new;
+        assert_eq!(htp, 2, "expected exactly 2 hash_to_point evals per action");
+        assert_eq!(sc, 0, "expected 0 CommitIvk short-commits per action");
+        assert_eq!(
+            cdn, 0,
+            "CommitDomain must be cached, not rebuilt per action"
+        );
+    }
+
+    #[test]
+    fn deduped_recovery_accepts_valid_and_matches_upstream() {
+        use super::recover_output_bound_with_ovk;
+        let fa = full_v3_action();
+        let domain = IronwoodDomain::for_action(&fa.action);
+
+        // Deduped path accepts and returns the correct memo.
+        let memo = recover_output_bound_with_ovk(
+            &domain, &fa.ovk, &fa.action, &fa.cv_net, &fa.out_ct, &fa.note,
+        );
+        assert_eq!(memo, Some(fa.memo));
+
+        // Cross-check: stock upstream recovery agrees (same note recovered).
+        let upstream =
+            try_output_recovery_with_ovk(&domain, &fa.ovk, &fa.action, &fa.cv_net, &fa.out_ct);
+        let (u_note, u_to, u_memo) = upstream.expect("stock recovery accepts valid action");
+        assert_eq!(u_note, fa.note);
+        assert_eq!(u_to, fa.recipient);
+        assert_eq!(u_memo, fa.memo);
+    }
+
+    #[test]
+    fn deduped_recovery_rejects_tampered_ciphertext() {
+        use super::recover_output_bound_with_pkd_esk;
+        let mut fa = full_v3_action();
+        let domain = IronwoodDomain::for_action(&fa.action);
+        let pk_d = IronwoodDomain::get_pk_d(&fa.note);
+        let esk = IronwoodDomain::derive_esk(&fa.note).unwrap();
+
+        // Flip a byte in the note ciphertext -> AEAD authentication fails.
+        let mut tampered = fa.action.encrypted_note().clone();
+        tampered.enc_ciphertext[0] ^= 0x01;
+        fa.action = Action::from_parts(
+            *fa.action.nullifier(),
+            redpallas::VerificationKey::dummy(),
+            *fa.action.cmx(),
+            tampered,
+            fa.cv_net.clone(),
+            (),
+        )
+        .unwrap();
+
+        let out = recover_output_bound_with_pkd_esk(&domain, pk_d, esk, &fa.action, &fa.note);
+        assert_eq!(out, None, "tampered ciphertext must be rejected");
+    }
+
+    #[test]
+    fn deduped_recovery_rejects_wrong_expected_note_fields() {
+        use super::recover_output_bound_with_ovk;
+        let fa = full_v3_action();
+        let domain = IronwoodDomain::for_action(&fa.action);
+
+        // Bind against a note with a DIFFERENT value than the ciphertext encodes.
+        // The plaintext decrypts fine, but the field comparison must reject it,
+        // proving the binding to the already-validated note is enforced (this is
+        // the security property that replaces the cmstar recomputation).
+        let rho = Rho::from_nf_old(*fa.action.nullifier());
+        let wrong_note = Note::from_parts(
+            fa.recipient,
+            NoteValue::from_raw(999),
+            rho,
+            fa.note.rseed().clone(),
+            NoteVersion::V3,
+        )
+        .unwrap();
+
+        let out = recover_output_bound_with_ovk(
+            &domain,
+            &fa.ovk,
+            &fa.action,
+            &fa.cv_net,
+            &fa.out_ct,
+            &wrong_note,
+        );
+        assert_eq!(
+            out, None,
+            "recovery bound to a mismatched note must be rejected"
+        );
+    }
+
+    #[test]
+    fn deduped_verify_note_commitment_rejects_wrong_cmx() {
+        // The cmx binding (verify_note_commitment) is unchanged and is the sole
+        // place cmx is derived. A tampered action cmx must still be rejected.
+        let fa = full_v3_action();
+        let rho = Rho::from_nf_old(*fa.action.nullifier());
+        let (_note, cm) = Note::from_parts_with_commitment(
+            fa.recipient,
+            fa.note.value(),
+            rho,
+            fa.note.rseed().clone(),
+            NoteVersion::V3,
+        )
+        .unwrap();
+        let cmx = ExtractedNoteCommitment::from(cm);
+
+        // Correct action cmx accepts.
+        assert_eq!(cmx, *fa.action.cmx());
+
+        // A different cmx (simulating a tampered action) is rejected.
+        let wrong_note = Note::new(
+            fa.recipient,
+            NoteValue::from_raw(7),
+            rho,
+            NoteVersion::V3,
+            &mut OsRng,
+        );
+        let wrong_cmx = ExtractedNoteCommitment::from(wrong_note.commitment());
+        assert_ne!(cmx, wrong_cmx, "tampered cmx must not match");
+    }
+
+    #[test]
+    fn deduped_recovery_rejects_wrong_rho_domain() {
+        // MUST-FIX #1: `rho` is the single NoteCommit input not present in the
+        // plaintext. The recovery variant must reject an `expected` note whose
+        // rho differs from the domain's (i.e. the action's), even though every
+        // in-plaintext field (diversifier, value, rseed, pk_d, version) matches.
+        // This is the case that made the pre-fix API strictly weaker than the
+        // upstream `cmstar` recomputation it replaced.
+        use super::recover_output_bound_with_pkd_esk;
+        let fa = full_v3_action();
+        let domain = IronwoodDomain::for_action(&fa.action);
+        let pk_d = IronwoodDomain::get_pk_d(&fa.note);
+        let esk = IronwoodDomain::derive_esk(&fa.note).unwrap();
+
+        // Same fields, but a DIFFERENT rho than the action/domain.
+        let other_rho = Rho::from_nf_old(Nullifier::dummy(&mut OsRng));
+        let wrong_rho_note = Note::from_parts(
+            fa.recipient,
+            fa.note.value(),
+            other_rho,
+            fa.note.rseed().clone(),
+            NoteVersion::V3,
+        )
+        .unwrap();
+        assert_ne!(domain.rho, wrong_rho_note.rho());
+
+        let out =
+            recover_output_bound_with_pkd_esk(&domain, pk_d, esk, &fa.action, &wrong_rho_note);
+        assert_eq!(
+            out, None,
+            "recovery must reject a note whose rho != domain.rho"
+        );
+    }
+
+    #[test]
+    fn deduped_recovery_rejects_wrong_domain_version_policy() {
+        // MUST-FIX #1: the accepted note version is a property of the *domain*
+        // policy, not of `expected`. Recovering a V3 action's output under the
+        // V2 `OrchardDomain` must reject (the `0x03` lead byte is not accepted by
+        // the V2 policy), matching upstream `try_output_recovery_*` under that
+        // domain.
+        use super::recover_output_bound_with_pkd_esk;
+        let fa = full_v3_action();
+        let orchard_domain = OrchardDomain::for_action(&fa.action);
+        let pk_d = IronwoodDomain::get_pk_d(&fa.note);
+        let esk = IronwoodDomain::derive_esk(&fa.note).unwrap();
+
+        let out =
+            recover_output_bound_with_pkd_esk(&orchard_domain, pk_d, esk, &fa.action, &fa.note);
+        assert_eq!(
+            out, None,
+            "V2 domain policy must reject a V3 note plaintext (lead byte 0x03)"
         );
     }
 }

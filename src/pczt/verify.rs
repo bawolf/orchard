@@ -1,7 +1,7 @@
 use core::fmt;
 
 use crate::{
-    keys::{FullViewingKey, SpendValidatingKey},
+    keys::{FullViewingKey, ScopeClassifier, SpendValidatingKey},
     note::{ExtractedNoteCommitment, Rho},
     value::ValueCommitment,
     Note,
@@ -104,25 +104,58 @@ impl super::Spend {
         &self,
         expected_fvk: Option<&FullViewingKey>,
     ) -> Result<(), VerifyError> {
+        self.verify_nullifier_with_classifier(expected_fvk, None)
+    }
+
+    /// Like [`Spend::verify_nullifier`], but reuses a session-cached
+    /// [`ScopeClassifier`] for the FVK-ownership check so that no per-action
+    /// `Commit^ivk` Sinsemilla evaluation is performed (DEDUP LEVER 3).
+    ///
+    /// MUST-FIX #3 (Fable review): the classifier is derived from the *device*
+    /// FVK, but a dummy spend (`value == 0`) is validated under the
+    /// host-supplied `spend.fvk` (see [`Spend::fvk_for_validation`]), which is a
+    /// random key unrelated to the device FVK. Classifying a dummy's recipient
+    /// with the device classifier would return `None` and reject an otherwise
+    /// valid bundle (a *rejects-valid* regression). So the cached classifier is
+    /// used **only** when the FVK actually used for validation is the device FVK
+    /// (`fvk == expected_fvk`); otherwise we fall back to `fvk.scope_for_address`
+    /// on whatever FVK `fvk_for_validation` selected. The accept/reject set is
+    /// therefore identical to `verify_nullifier`; only the Sinsemilla cost of the
+    /// non-dummy path changes.
+    pub fn verify_nullifier_with_classifier(
+        &self,
+        expected_fvk: Option<&FullViewingKey>,
+        classifier: Option<&ScopeClassifier>,
+    ) -> Result<(), VerifyError> {
         let fvk = self.fvk_for_validation(expected_fvk)?;
 
-        let note = Note::from_parts(
+        // DEDUP LEVER 1: derive the spend note commitment `cm_old` exactly once
+        // (constructibility check) and reuse it for nullifier derivation, instead
+        // of recomputing it inside `note.nullifier(fvk)`.
+        let (note, cm_old) = Note::from_parts_with_commitment(
             self.recipient.ok_or(VerifyError::MissingRecipient)?,
             self.value.ok_or(VerifyError::MissingValue)?,
             self.rho.ok_or(VerifyError::MissingRho)?,
             self.rseed.ok_or(VerifyError::MissingRandomSeed)?,
             self.note_version,
         )
-        .into_option()
         .ok_or(VerifyError::InvalidSpendNote)?;
 
         // We need both the note and the FVK to verify the nullifier; we have everything
         // needed to also verify that the correct FVK was provided (the nullifier check
-        // itself only constrains `nk` within the FVK).
-        fvk.scope_for_address(&note.recipient())
-            .ok_or(VerifyError::WrongFvkForNote)?;
+        // itself only constrains `nk` within the FVK). Prefer the cached classifier,
+        // but ONLY when it belongs to the FVK we are validating under (the device
+        // FVK for a real spend); dummy spends fall back to the per-call
+        // `Commit^ivk` derivation on their own host-supplied FVK.
+        let owned = match (classifier, expected_fvk) {
+            (Some(c), Some(exp)) if fvk == exp => c.scope_for_address(&note.recipient()).is_some(),
+            _ => fvk.scope_for_address(&note.recipient()).is_some(),
+        };
+        if !owned {
+            return Err(VerifyError::WrongFvkForNote);
+        }
 
-        if note.nullifier(fvk) == self.nullifier {
+        if note.nullifier_with_commitment(fvk, &cm_old) == self.nullifier {
             Ok(())
         } else {
             Err(VerifyError::InvalidNullifier)
@@ -164,19 +197,28 @@ impl super::Output {
     /// - `rseed`
     ///
     /// `spend` must be the Spend from the same Orchard action.
-    pub fn verify_note_commitment(&self, spend: &super::Spend) -> Result<(), VerifyError> {
-        let note = Note::from_parts(
+    pub fn verify_note_commitment(&self, spend: &super::Spend) -> Result<Note, VerifyError> {
+        // DEDUP LEVER 1: derive the output note commitment `cmx` exactly once
+        // (from `from_parts_with_commitment`) instead of once for the
+        // constructibility check and again in `note.commitment()`.
+        //
+        // MUST-FIX #4 (Fable review): return the *validated* note so the engine
+        // (`verify_encryption`) reuses this exact object for output recovery
+        // instead of rebuilding it with a second `cmx` Sinsemilla evaluation.
+        // The returned note is the one whose commitment was just checked to equal
+        // `self.cmx`, so MUST-FIX #2's "binding is self-contained" property holds:
+        // the note handed to recovery is, by construction, the cmx-bound note.
+        let (note, cm) = Note::from_parts_with_commitment(
             self.recipient.ok_or(VerifyError::MissingRecipient)?,
             self.value.ok_or(VerifyError::MissingValue)?,
             Rho::from_nf_old(spend.nullifier),
             self.rseed.ok_or(VerifyError::MissingRandomSeed)?,
             self.note_version,
         )
-        .into_option()
         .ok_or(VerifyError::InvalidOutputNote)?;
 
-        if ExtractedNoteCommitment::from(note.commitment()) == self.cmx {
-            Ok(())
+        if ExtractedNoteCommitment::from(cm) == self.cmx {
+            Ok(note)
         } else {
             Err(VerifyError::InvalidExtractedNoteCommitment)
         }

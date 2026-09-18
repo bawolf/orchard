@@ -215,13 +215,23 @@ pub(crate) fn commit_ivk(
 ) -> CtOption<pallas::Base> {
     // We rely on the API contract that to_le_bits() returns at least PrimeField::NUM_BITS
     // bits, which is equal to L_ORCHARD_BASE.
-    let domain = sinsemilla::CommitDomain::new(COMMIT_IVK_PERSONALIZATION);
+    // DEDUP LEVER 2: cache the CommitIvk `CommitDomain` generators (see
+    // `commit_ivk_domain`) instead of rebuilding them per call.
+    let domain = commit_ivk_domain();
     domain.short_commit(
         iter::empty()
             .chain(ak.to_le_bits().iter().by_vals().take(L_ORCHARD_BASE))
             .chain(nk.to_le_bits().iter().by_vals().take(L_ORCHARD_BASE)),
         rivk,
     )
+}
+
+/// Process-wide cached `CommitDomain` for `Commit^ivk` (DEDUP LEVER 2).
+fn commit_ivk_domain() -> &'static sinsemilla::CommitDomain {
+    use alloc::boxed::Box;
+    use once_cell::race::OnceBox;
+    static DOMAIN: OnceBox<sinsemilla::CommitDomain> = OnceBox::new();
+    DOMAIN.get_or_init(|| Box::new(sinsemilla::CommitDomain::new(COMMIT_IVK_PERSONALIZATION)))
 }
 
 /// Defined in [Zcash Protocol Spec § 5.4.1.6: DiversifyHash^Sapling and DiversifyHash^Orchard Hash Functions][concretediversifyhash].

@@ -400,6 +400,23 @@ impl FullViewingKey {
             .find(|scope| &self.address(address.diversifier(), *scope) == address)
     }
 
+    /// Builds a [`ScopeClassifier`] that derives the external and internal
+    /// key-agreement keys (`ivk`, i.e. `Commit^ivk`) **once** and reuses them
+    /// for every subsequent address classification (DEDUP LEVER 3).
+    ///
+    /// `scope_for_address` calls `KeyAgreementPrivateKey::from_fvk` (a
+    /// Sinsemilla `Commit^ivk` short-commit) on every invocation — twice per
+    /// action during bundle verification, plus the two derivations already
+    /// performed while building the `FullViewingKey`. Since `ivk` is a wallet
+    /// constant, deriving it once per session removes all per-action
+    /// `Commit^ivk` Sinsemilla evaluations.
+    pub fn scope_classifier(&self) -> ScopeClassifier {
+        ScopeClassifier {
+            external: KeyAgreementPrivateKey::from_fvk(self),
+            internal: KeyAgreementPrivateKey::from_fvk(&self.derive_internal()),
+        }
+    }
+
     /// Serializes the full viewing key as specified in [Zcash Protocol Spec § 5.6.4.4: Orchard Raw Full Viewing Keys][orchardrawfullviewingkeys]
     ///
     /// [orchardrawfullviewingkeys]: https://zips.z.cash/protocol/protocol.pdf#orchardfullviewingkeyencoding
@@ -560,6 +577,35 @@ impl Diversifier {
 /// decryption of notes). When we actually want to serialize ivk, we're guaranteed to get
 /// a valid base field element encoding, because we always construct ivk from an integer
 /// in the correct range.
+/// A session-lifetime cache of a [`FullViewingKey`]'s external and internal
+/// key-agreement keys, used to classify addresses without recomputing the
+/// Sinsemilla `Commit^ivk` on every call (DEDUP LEVER 3).
+///
+/// Build one with [`FullViewingKey::scope_classifier`] at session start and
+/// reuse it for every action. Classification then costs only a
+/// diversify-hash (`hash_to_curve`, not Sinsemilla) plus a scalar
+/// multiplication per candidate scope — zero Sinsemilla work.
+#[derive(Clone, Debug)]
+pub struct ScopeClassifier {
+    external: KeyAgreementPrivateKey,
+    internal: KeyAgreementPrivateKey,
+}
+
+impl ScopeClassifier {
+    /// Returns the scope of the given address, or `None` if it is not derived
+    /// from the originating full viewing key. Semantically identical to
+    /// [`FullViewingKey::scope_for_address`], but performs no Sinsemilla work.
+    pub fn scope_for_address(&self, address: &Address) -> Option<Scope> {
+        if &self.external.address(address.diversifier()) == address {
+            Some(Scope::External)
+        } else if &self.internal.address(address.diversifier()) == address {
+            Some(Scope::Internal)
+        } else {
+            None
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct KeyAgreementPrivateKey(NonZeroPallasScalar);
 

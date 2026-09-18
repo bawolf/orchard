@@ -43,6 +43,9 @@ serde = { version = "1.0", default-features = false, features = ["derive"] }
 sinsemilla = "0.1"
 subtle = { version = "2.6", default-features = false }
 zcash_note_encryption = "0.4"
+chacha20 = { version = "0.9", default-features = false }
+chacha20poly1305 = { version = "0.10", default-features = false }
+once_cell = { version = "1", default-features = false, features = ["alloc", "race"] }
 incrementalmerkletree = "0.8.1"
 zcash_spec = "0.2.1"
 zip32 = { version = "0.2.0", default-features = false }

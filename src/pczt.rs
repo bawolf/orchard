@@ -508,6 +508,203 @@ mod tests {
         builder.build_for_pczt(&mut rng).unwrap().0
     }
 
+    /// Builds a real Ironwood v3 pczt bundle with one *value-bearing*,
+    /// device-owned spend and one value-bearing, device-owned (OVK-recoverable)
+    /// output, plus the builder's padding actions. Used to drive the REAL
+    /// `verify_bundle` per-action path (not a hand-inlined model).
+    fn ironwood_real_spend_pczt_bundle(mut rng: OsRng) -> (super::Bundle, FullViewingKey) {
+        let sk = SpendingKey::random(&mut rng);
+        let fvk = FullViewingKey::from(&sk);
+        let spend_recipient = fvk.address_at(0u32, Scope::External);
+        let out_recipient = fvk.address_at(0u32, Scope::External);
+        let bundle_version = BundleVersion::ironwood_v3();
+        let note_version = bundle_version.note_version();
+
+        let rho = Rho::from_nf_old(Nullifier::dummy(&mut rng));
+        let note = Note::new(
+            spend_recipient,
+            NoteValue::from_raw(5_000),
+            rho,
+            note_version,
+            &mut rng,
+        );
+        let merkle_path = MerklePath::dummy(&mut rng);
+        let anchor = merkle_path.root(note.commitment().into());
+
+        let mut builder = Builder::new(
+            BundleType::DEFAULT,
+            bundle_version,
+            bundle_version.default_flags(),
+            anchor,
+        )
+        .unwrap();
+        builder.add_spend(fvk.clone(), note, merkle_path).unwrap();
+        // OVK-recoverable, value-bearing output owned by the device FVK.
+        builder
+            .add_output(
+                Some(fvk.to_ovk(Scope::External)),
+                out_recipient,
+                NoteValue::from_raw(5_000),
+                [0u8; 512],
+            )
+            .unwrap();
+
+        let (pczt_bundle, _meta) = builder.build_for_pczt(&mut rng).unwrap();
+        (pczt_bundle, fvk)
+    }
+
+    /// MUST-FIX #4 re-measurement: drives the REAL orchard verification methods
+    /// (`Spend::verify_nullifier_with_classifier`, `Output::verify_note_commitment`
+    /// which now returns the validated note, the cached `ScopeClassifier`, and the
+    /// device-local `recover_output_bound_with_*`) in exactly the order
+    /// `verify_bundle` calls them, and counts Sinsemilla `hash_to_point` evals per
+    /// action. This is the code AS WRITTEN, not a hand-inlined ideal.
+    #[test]
+    fn real_verify_bundle_sinsemilla_count_per_action() {
+        use crate::keys::OutgoingViewingKey;
+        use crate::note_encryption::{
+            recover_output_bound_with_ock, recover_output_bound_with_ovk,
+            recover_output_bound_with_pkd_esk, IronwoodDomain,
+        };
+        use zcash_note_encryption::Domain;
+
+        fn diff(before: sinsemilla::SinsemillaCounters) -> (u64, u64, u64, u64) {
+            let a = sinsemilla::counters_snapshot();
+            (
+                a.htp_calls - before.htp_calls,
+                a.commit_calls - before.commit_calls,
+                a.shortcommit_calls - before.shortcommit_calls,
+                a.commitdomain_new - before.commitdomain_new,
+            )
+        }
+
+        let (bundle, fvk) = ironwood_real_spend_pczt_bundle(OsRng);
+
+        // ---- SESSION PHASE: build the ivk cache once per bundle. ----
+        let s0 = sinsemilla::counters_snapshot();
+        let classifier = fvk.scope_classifier();
+        let (s_htp, _s_c, s_sc, _s_cdn) = diff(s0);
+        std::println!(
+            "REALCOUNT[SESSION scope_classifier]: htp_calls={} short_commit={}",
+            s_htp,
+            s_sc
+        );
+
+        let mut spend_action_seen = 0usize;
+        let mut output_action_seen = 0usize;
+        for (idx, action) in bundle.actions().iter().enumerate() {
+            let spend = action.spend();
+            let output = action.output();
+            let spend_value = spend.value().map(|v| v.inner()).unwrap_or(0);
+            let output_value = output.value().map(|v| v.inner()).unwrap_or(0);
+
+            let a0 = sinsemilla::counters_snapshot();
+
+            // verify_cv_net (no Sinsemilla) + verify_nullifier (classifier) + verify_rk.
+            action.verify_cv_net().expect("cv_net");
+            action
+                .spend()
+                .verify_nullifier_with_classifier(Some(&fvk), Some(&classifier))
+                .expect("nullifier");
+            action.spend().verify_rk(Some(&fvk)).expect("rk");
+
+            // verify_note_commitment now returns the validated note.
+            let note = action
+                .output()
+                .verify_note_commitment(action.spend())
+                .expect("note commitment");
+
+            // verify_bundle's recipient scope classification (cached ivk).
+            let recipient = output.recipient().expect("recipient");
+            let recipient_scope = classifier.scope_for_address(&recipient);
+            let outgoing_scope = if recipient_scope == Some(Scope::Internal) {
+                Scope::Internal
+            } else {
+                Scope::External
+            };
+
+            // verify_encryption: device-local recovery bound to the *threaded* note.
+            let domain = IronwoodDomain::for_pczt_action(action);
+            let _m = recover_output_bound_with_pkd_esk(
+                &domain,
+                IronwoodDomain::get_pk_d(&note),
+                IronwoodDomain::derive_esk(&note).expect("esk"),
+                action,
+                &note,
+            )
+            .expect("pkd_esk recovery");
+            let out_ciphertext = &output.encrypted_note().out_ciphertext;
+            if let Some(ock) = output.ock() {
+                let _ = recover_output_bound_with_ock(&domain, ock, action, out_ciphertext, &note)
+                    .expect("ock recovery");
+            }
+            if note.value().inner() > 0 {
+                let ovk: OutgoingViewingKey = fvk.to_ovk(outgoing_scope);
+                let _ = recover_output_bound_with_ovk(
+                    &domain,
+                    &ovk,
+                    action,
+                    action.cv_net(),
+                    out_ciphertext,
+                    &note,
+                )
+                .expect("ovk recovery");
+            }
+
+            let (htp, commit, sc, cdn) = diff(a0);
+            std::println!(
+                "REALCOUNT[action {} spend_value={} output_value={}]: htp_calls={} commit={} short_commit={} commitdomain_new={}",
+                idx, spend_value, output_value, htp, commit, sc, cdn
+            );
+
+            assert_eq!(
+                cdn, 0,
+                "CommitDomain must be cached, not rebuilt per action"
+            );
+
+            // htp_calls = NoteCommit + CommitIvk (short_commit routes through
+            // commit). The core dedup invariant: EXACTLY 2 NoteCommit per action
+            // (spend cm_old + output cmx), no matter the action shape.
+            let note_commits = htp - sc;
+            assert_eq!(commit - sc, 2, "exactly 2 NoteCommit per action");
+            assert_eq!(
+                note_commits, 2,
+                "exactly 2 NoteCommit hash_to_point per action"
+            );
+
+            if spend_value > 0 {
+                // Device-owned real spend: ownership check uses the cached
+                // classifier => 0 CommitIvk => 2 hash_to_point total. This is the
+                // MUST-FIX #4 "2 evals/action" result on the REAL path.
+                spend_action_seen += 1;
+                assert_eq!(
+                    sc, 0,
+                    "device-spend action: 0 CommitIvk (cached classifier)"
+                );
+                assert_eq!(htp, 2, "device-spend action: exactly 2 hash_to_point evals");
+            } else {
+                // Dummy/padding spend (value == 0) validates under its own
+                // host-supplied FVK (MUST-FIX #3: no device classifier), so its
+                // ownership check costs 1 CommitIvk. True minimum here is 3
+                // (2 NoteCommit + 1 CommitIvk) — the stock baseline pays it too.
+                output_action_seen += 1;
+                assert_eq!(
+                    sc, 1,
+                    "dummy-spend action keeps its own-FVK scope check (MUST-FIX #3)"
+                );
+                assert_eq!(htp, 3, "dummy-spend action: 2 NoteCommit + 1 CommitIvk");
+            }
+        }
+        assert!(
+            spend_action_seen >= 1,
+            "fixture must contain a device-owned spend action"
+        );
+        assert!(
+            output_action_seen >= 1,
+            "fixture must contain a dummy/padding spend action"
+        );
+    }
+
     fn identity_rk() -> redpallas::VerificationKey<SpendAuth> {
         redpallas::VerificationKey::<SpendAuth>::try_from([0u8; 32])
             .expect("plain redpallas accepts the identity encoding")
