@@ -604,6 +604,24 @@ impl ScopeClassifier {
             None
         }
     }
+
+    /// Overwrites the two cached `ivk` scalars so the secret does not linger in
+    /// freed memory (streaming-signing 16/32 integration, MUST-FIX #3).
+    ///
+    /// `orchard` and `pasta_curves` both `#![forbid(unsafe_code)]` and
+    /// `pallas::Scalar` implements no `Zeroize`, so this cannot do a volatile
+    /// zero. Instead it replaces each scalar with a fixed public constant
+    /// (`NonZeroPallasScalar::default()` = `1`) and roots the stores with
+    /// `black_box` so dead-store elimination cannot drop the overwrite of a
+    /// soon-to-be-freed value; the secret bytes are gone either way. Callers on
+    /// the device signing path invoke this before the caching `Body` is
+    /// released and on every teardown path.
+    pub fn wipe(&mut self) {
+        self.external = KeyAgreementPrivateKey(NonZeroPallasScalar::default());
+        self.internal = KeyAgreementPrivateKey(NonZeroPallasScalar::default());
+        let _ = core::hint::black_box(&self.external);
+        let _ = core::hint::black_box(&self.internal);
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
