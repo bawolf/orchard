@@ -559,24 +559,6 @@ impl Diversifier {
     }
 }
 
-/// The private key $\mathsf{ivk}$ used in $KA^{Orchard}$, for decrypting incoming notes.
-///
-/// In Sapling this is what was encoded as an incoming viewing key. For Orchard, we store
-/// both this and [`DiversifierKey`] inside [`IncomingViewingKey`] for usability (to
-/// enable deriving the default address for an incoming viewing key), while this separate
-/// type represents $\mathsf{ivk}$.
-///
-/// Defined in [Zcash Protocol Spec § 4.2.3: Orchard Key Components][orchardkeycomponents].
-///
-/// [orchardkeycomponents]: https://zips.z.cash/protocol/nu5.pdf#orchardkeycomponents
-///
-/// # Implementation notes
-///
-/// We store $\mathsf{ivk}$ in memory as a scalar instead of a base, so that we aren't
-/// incurring an expensive serialize-and-parse step every time we use it (e.g. for trial
-/// decryption of notes). When we actually want to serialize ivk, we're guaranteed to get
-/// a valid base field element encoding, because we always construct ivk from an integer
-/// in the correct range.
 /// A session-lifetime cache of a [`FullViewingKey`]'s external and internal
 /// key-agreement keys, used to classify addresses without recomputing the
 /// Sinsemilla `Commit^ivk` on every call (DEDUP LEVER 3).
@@ -624,6 +606,24 @@ impl ScopeClassifier {
     }
 }
 
+/// The private key $\mathsf{ivk}$ used in $KA^{Orchard}$, for decrypting incoming notes.
+///
+/// In Sapling this is what was encoded as an incoming viewing key. For Orchard, we store
+/// both this and [`DiversifierKey`] inside [`IncomingViewingKey`] for usability (to
+/// enable deriving the default address for an incoming viewing key), while this separate
+/// type represents $\mathsf{ivk}$.
+///
+/// Defined in [Zcash Protocol Spec § 4.2.3: Orchard Key Components][orchardkeycomponents].
+///
+/// [orchardkeycomponents]: https://zips.z.cash/protocol/nu5.pdf#orchardkeycomponents
+///
+/// # Implementation notes
+///
+/// We store $\mathsf{ivk}$ in memory as a scalar instead of a base, so that we aren't
+/// incurring an expensive serialize-and-parse step every time we use it (e.g. for trial
+/// decryption of notes). When we actually want to serialize ivk, we're guaranteed to get
+/// a valid base field element encoding, because we always construct ivk from an integer
+/// in the correct range.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct KeyAgreementPrivateKey(NonZeroPallasScalar);
 
