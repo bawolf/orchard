@@ -304,6 +304,9 @@ jobs:
         if: failure()
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Pin gh to THIS fork. Without it gh prefers the git remote named
+          # `upstream` and would aim issue/label calls at the upstream repo.
+          GH_REPO: ${{ github.repository }}
           UPSTREAM_BRANCH: ${{ steps.drift.outputs.upstream_branch }}
           UPSTREAM_RANGE: ${{ steps.drift.outputs.range }}
           BEHIND: ${{ steps.drift.outputs.behind }}
@@ -337,7 +340,7 @@ jobs:
             echo
             echo "This issue closes itself on the next green sync."
           } > /tmp/issue-body.md
-          gh label create upstream-sync --color B60205 --description "Automated upstream sync problems" 2>/dev/null || true
+          gh label create upstream-sync --color B60205 --description "Automated upstream sync problems" --force
           existing="$(gh issue list --state open --label upstream-sync --limit 1 --json number --jq '.[0].number // empty')"
           if [ -n "$existing" ]; then
             gh issue edit "$existing" --title "$title" --body-file /tmp/issue-body.md
@@ -351,6 +354,9 @@ jobs:
         if: success()
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Pin gh to THIS fork. Without it gh prefers the git remote named
+          # `upstream` and would aim issue/label calls at the upstream repo.
+          GH_REPO: ${{ github.repository }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -euo pipefail
