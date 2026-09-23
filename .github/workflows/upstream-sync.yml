@@ -1,0 +1,360 @@
+name: Upstream sync (zcash/orchard)
+
+# Weekly (and on demand): pull zcash/orchard into our Ironwood branch, run the
+# gates the Ironwood firmware depends on, and either push the merge or FAIL
+# LOUDLY -- a red run (which emails you) plus a GitHub issue labelled
+# `upstream-sync` naming the exact files in trouble.
+#
+# ---------------------------------------------------------------------------
+# MERGE, NEVER REBASE.  This is load-bearing; do not "clean it up".
+# ---------------------------------------------------------------------------
+# The Ironwood firmware pins this fork by exact commit SHA, in
+# core/embed/Cargo.toml:
+#     [patch.crates-io]
+#     orchard = { git = "https://github.com/bawolf/orchard", rev = "d4792911..." }
+# A rebase rewrites our commits, so the rewritten branch no longer has the old
+# SHA as an ancestor; GitHub eventually garbage-collects unreferenced objects and
+# every firmware tree still pinned at that rev can no longer fetch it -- a build
+# break with no local cause. `git merge` keeps every SHA we have ever pinned
+# reachable from the branch tip forever, so old pins keep resolving while new
+# work moves forward. Keep this a merge.
+# ---------------------------------------------------------------------------
+
+on:
+  schedule:
+    # Mondays, 06:41 UTC (offset from the sinsemilla job).
+    # NOTE: GitHub only schedules workflow files that exist on the repository's
+    # DEFAULT branch. This file lives on `ironwood/direct-scope-classifier`, so
+    # the weekly trigger stays dormant until this branch is the fork's default
+    # branch (or a copy of this file lands on the default branch).
+    # `workflow_dispatch` works either way. See docs/FORK_MAINTENANCE.md in the
+    # trezor-ironwood repo.
+    - cron: '41 6 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: upstream-sync-orchard
+  cancel-in-progress: false
+
+env:
+  OUR_BRANCH: ironwood/direct-scope-classifier
+  UPSTREAM_SLUG: zcash/orchard
+  UPSTREAM_URL: https://github.com/zcash/orchard.git
+  # Trezor Safe 5 / T3T1 core. The firmware takes orchard with
+  # default-features = false (core/embed/Cargo.toml), so that is what we check.
+  NOSTD_TARGET: thumbv8m.main-none-eabihf
+  # Must match RUSTUP_TOOLCHAIN in the firmware's build env.
+  PINNED_NIGHTLY: nightly-2026-03-16
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Cheap, read-only, no merge, no writes. Still tells you the drift even if the
+  # sync job is blocked (restricted Actions permissions, missing token, ...).
+  # ---------------------------------------------------------------------------
+  upstream-drift:
+    name: Drift report (no merge)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Check out our branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.OUR_BRANCH }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Count commits behind upstream
+        run: |
+          set -euo pipefail
+          git remote add upstream "$UPSTREAM_URL"
+          git fetch --no-tags --quiet upstream
+          def="$(git ls-remote --symref upstream HEAD | awk '$1 == "ref:" { sub("refs/heads/", "", $2); print $2; exit }')"
+          if [ -z "${def:-}" ]; then
+            for cand in main master; do
+              if git show-ref --verify --quiet "refs/remotes/upstream/$cand"; then def="$cand"; break; fi
+            done
+          fi
+          if [ -z "${def:-}" ]; then
+            echo "::error::could not detect the default branch of $UPSTREAM_SLUG"
+            exit 1
+          fi
+          behind="$(git rev-list --count "HEAD..upstream/$def")"
+          ahead="$(git rev-list --count "upstream/$def..HEAD")"
+          {
+            echo "## Drift vs \`$UPSTREAM_SLUG\`"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| our branch | \`$OUR_BRANCH\` @ \`$(git rev-parse --short HEAD)\` |"
+            echo "| upstream default branch | \`$def\` @ \`$(git rev-parse --short "upstream/$def")\` |"
+            echo "| commits behind | **$behind** |"
+            echo "| commits ahead (our patches) | $ahead |"
+            echo
+            if [ "$behind" -gt 0 ]; then
+              echo "### Upstream commits we do not have"
+              echo
+              git log --oneline --no-decorate "HEAD..upstream/$def" | sed 's/^/- /'
+            else
+              echo "Up to date."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------------
+  # The real thing: merge, gate, push -- or yell.
+  # ---------------------------------------------------------------------------
+  upstream-sync:
+    name: Merge upstream and gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Check out our branch (full history -- the merge needs it)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.OUR_BRANCH }}
+          fetch-depth: 0
+
+      - name: Install Rust (rust-toolchain.toml, plus the firmware's pinned nightly)
+        run: |
+          set -euo pipefail
+          # The crate carries rust-toolchain.toml, so plain `cargo ...` resolves
+          # to the pinned channel with clippy + rustfmt. `rustup show` installs it.
+          # Note: an upstream merge may raise that pin (upstream is moving to
+          # 1.88); that is fine, this step follows the file.
+          rustup show
+          rustup toolchain install "$PINNED_NIGHTLY" --profile minimal --target "$NOSTD_TARGET"
+          cargo --version
+          rustc "+$PINNED_NIGHTLY" --version
+
+      - name: Some dev-dependencies need fontconfig (dev-graph / plotters)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libfontconfig1-dev
+
+      - name: Fetch upstream and measure drift
+        id: drift
+        run: |
+          set -euo pipefail
+          git config user.name  "ironwood-upstream-sync"
+          git config user.email "ironwood-upstream-sync@users.noreply.github.com"
+          git remote add upstream "$UPSTREAM_URL"
+          git fetch --no-tags upstream
+          def="$(git ls-remote --symref upstream HEAD | awk '$1 == "ref:" { sub("refs/heads/", "", $2); print $2; exit }')"
+          if [ -z "${def:-}" ]; then
+            for cand in main master; do
+              if git show-ref --verify --quiet "refs/remotes/upstream/$cand"; then def="$cand"; break; fi
+            done
+          fi
+          if [ -z "${def:-}" ]; then
+            echo "::error::could not detect the default branch of $UPSTREAM_SLUG"
+            exit 1
+          fi
+          base="$(git rev-parse HEAD)"
+          tip="$(git rev-parse "upstream/$def")"
+          behind="$(git rev-list --count "HEAD..upstream/$def")"
+          {
+            echo "upstream_branch=$def"
+            echo "behind=$behind"
+            echo "range=${base:0:12}..${tip:0:12}"
+          } >> "$GITHUB_OUTPUT"
+          {
+            echo "## Upstream sync"
+            echo
+            echo "- our branch: \`$OUR_BRANCH\` @ \`${base:0:12}\`"
+            echo "- upstream: \`$UPSTREAM_SLUG@$def\` @ \`${tip:0:12}\`"
+            echo "- commits behind: **$behind**"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Merge upstream (MERGE, never rebase -- see the header comment)
+        if: steps.drift.outputs.behind != '0'
+        id: merge
+        run: |
+          set -uo pipefail
+          def='${{ steps.drift.outputs.upstream_branch }}'
+          if git merge --no-edit "upstream/$def"; then
+            echo "merged=yes" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          conflicts="$(git diff --name-only --diff-filter=U || true)"
+          git merge --abort || git reset --hard HEAD
+          {
+            echo "### Conflicting files"
+            echo
+            printf '%s\n' "$conflicts" | sed 's/^/- `/; s/$/`/'
+          } > /tmp/upstream-sync-detail.md
+          echo "STAGE=merge conflict" >> "$GITHUB_ENV"
+          echo "::error::merge of upstream/$def conflicts; the merge was aborted and nothing was pushed"
+          exit 1
+
+      - name: Gate matrix
+        if: steps.merge.outputs.merged == 'yes'
+        run: |
+          set -uo pipefail
+          FAILED=0
+          : > /tmp/gate-results.md
+          run_gate() {
+            local name="$1"; shift
+            echo "::group::gate: $name -- $*"
+            if "$@"; then
+              echo "::endgroup::"
+              printf -- '- `%s` -- PASS\n' "$name" >> /tmp/gate-results.md
+            else
+              rc=$?
+              echo "::endgroup::"
+              echo "::error::gate failed: $name (exit $rc)"
+              printf -- '- `%s` -- **FAIL** (exit %s)\n' "$name" "$rc" >> /tmp/gate-results.md
+              FAILED=1
+            fi
+          }
+
+          # Every gate below was verified green locally at 0b04326 on 2026-09-22.
+          # Only add a gate here after it passes at HEAD, so a red run always
+          # means "upstream broke us", never "this gate was already broken".
+          #
+          # DELIBERATELY ABSENT: `cargo test`, and `cargo clippy --all-targets`.
+          # Both fail at 0b04326 for a reason that has nothing to do with
+          # upstream: the `#[cfg(test)]` instrumentation added in 5f527f8
+          # ("perf(pczt): Sinsemilla dedup on the verify path") calls
+          # `sinsemilla::counters_snapshot()` and names
+          # `sinsemilla::SinsemillaCounters`, and neither symbol exists in
+          # sinsemilla 0.1.0 from crates.io *or* in bawolf/sinsemilla@6ca88ff.
+          # The orchard test target therefore does not compile today. See the
+          # advisory step below; once the counters land in the sinsemilla fork
+          # (or the instrumentation is removed), promote `cargo test` into this
+          # matrix -- it is the gate we most want here.
+          run_gate "fmt"                 cargo fmt --check
+          run_gate "check"               cargo check
+          run_gate "check:all-features"  cargo check --all-features
+          run_gate "clippy:lib"          cargo clippy --all-features -- -D warnings
+          run_gate "test:doc"            cargo test --doc
+          run_gate "check:benches"       cargo check --benches
+          # Bare-metal build for the Safe 5 core, with the firmware's exact
+          # toolchain, target and feature set (the firmware takes orchard with
+          # default-features = false).
+          run_gate "no_std:$NOSTD_TARGET" \
+            cargo "+$PINNED_NIGHTLY" check --target "$NOSTD_TARGET" --no-default-features
+
+          {
+            echo
+            echo "### Gate matrix"
+            echo
+            cat /tmp/gate-results.md
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$FAILED" -ne 0 ]; then
+            { echo "### Failing gates"; echo; cat /tmp/gate-results.md; } > /tmp/upstream-sync-detail.md
+            echo "STAGE=gate failure after a clean merge" >> "$GITHUB_ENV"
+            exit 1
+          fi
+
+      # Advisory, NOT blocking -- see the long comment in the gate matrix above.
+      # When this step goes green, delete `continue-on-error` and move
+      # `cargo test` / `cargo clippy --all-targets` into the blocking matrix.
+      - name: Full test + clippy (advisory -- test target does not compile at 0b04326)
+        if: steps.merge.outputs.merged == 'yes'
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+          cargo test
+          cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Push the merge to our branch
+        if: steps.merge.outputs.merged == 'yes'
+        env:
+          # Optional. The default GITHUB_TOKEN is refused by GitHub when a push
+          # touches `.github/workflows/**`, and an upstream merge can easily
+          # carry workflow changes (zcash/orchard has five of them). Add a
+          # fine-grained PAT with Contents:write AND Workflows:write as the repo
+          # secret UPSTREAM_SYNC_TOKEN to make that case work; without it, that
+          # one case fails loudly instead of silently.
+          PUSH_TOKEN: ${{ secrets.UPSTREAM_SYNC_TOKEN || secrets.GITHUB_TOKEN }}
+        run: |
+          set -uo pipefail
+          git remote set-url origin "https://x-access-token:${PUSH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          # Our old tip is an ancestor of the merge commit, so this can never
+          # rewrite history and can never orphan a pinned SHA.
+          if git push origin "HEAD:refs/heads/$OUR_BRANCH"; then
+            {
+              echo
+              echo "Pushed \`$(git rev-parse --short HEAD)\` to \`$OUR_BRANCH\`."
+              echo
+              echo "The firmware still pins the OLD sha -- bump it in"
+              echo "\`core/embed/Cargo.toml\` when you are ready. See FORK_MAINTENANCE.md."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          {
+            echo "### Push refused"
+            echo
+            echo "The merge and every gate passed, but pushing \`$OUR_BRANCH\` failed."
+            echo "If the error mentions \`refusing to allow ... to create or update workflow\`,"
+            echo "the merge carried a change under \`.github/workflows/\` and the default"
+            echo "\`GITHUB_TOKEN\` may not push those. Add a PAT with Workflows:write as the"
+            echo "repo secret \`UPSTREAM_SYNC_TOKEN\` and re-run."
+          } > /tmp/upstream-sync-detail.md
+          echo "STAGE=push refused (merge and gates were green)" >> "$GITHUB_ENV"
+          exit 1
+
+      # ---- the yelling ----
+      - name: Open or update the failure issue
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          UPSTREAM_BRANCH: ${{ steps.drift.outputs.upstream_branch }}
+          UPSTREAM_RANGE: ${{ steps.drift.outputs.range }}
+          BEHIND: ${{ steps.drift.outputs.behind }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          today="$(date -u +%Y-%m-%d)"
+          title="Upstream sync failed: conflicts with $UPSTREAM_SLUG $today"
+          {
+            echo "The weekly upstream sync of \`$OUR_BRANCH\` against \`$UPSTREAM_SLUG\` failed."
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| stage | ${STAGE:-unknown} |"
+            echo "| upstream branch | \`${UPSTREAM_BRANCH:-?}\` |"
+            echo "| upstream range | \`${UPSTREAM_RANGE:-?}\` |"
+            echo "| commits behind | ${BEHIND:-?} |"
+            echo "| run | $RUN_URL |"
+            echo
+            cat /tmp/upstream-sync-detail.md 2>/dev/null || echo "_No detail captured; read the run log._"
+            echo
+            echo "---"
+            echo
+            echo "**Nothing was pushed.** Our branch is untouched and every SHA the firmware"
+            echo "pins is still reachable. Resolve by hand in a local checkout:"
+            echo
+            echo '```'
+            echo "git fetch upstream"
+            echo "git merge upstream/${UPSTREAM_BRANCH:-main}   # merge, never rebase"
+            echo '```'
+            echo
+            echo "This issue closes itself on the next green sync."
+          } > /tmp/issue-body.md
+          gh label create upstream-sync --color B60205 --description "Automated upstream sync problems" 2>/dev/null || true
+          existing="$(gh issue list --state open --label upstream-sync --limit 1 --json number --jq '.[0].number // empty')"
+          if [ -n "$existing" ]; then
+            gh issue edit "$existing" --title "$title" --body-file /tmp/issue-body.md
+            gh issue comment "$existing" --body "Still failing as of $today -- $RUN_URL"
+            echo "updated issue #$existing"
+          else
+            gh issue create --title "$title" --body-file /tmp/issue-body.md --label upstream-sync
+          fi
+
+      - name: Close the failure issue now that we are green
+        if: success()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          tip="$(git rev-parse --short HEAD)"
+          for n in $(gh issue list --state open --label upstream-sync --limit 20 --json number --jq '.[].number'); do
+            gh issue close "$n" --comment "Upstream sync is green again ($RUN_URL). \`$OUR_BRANCH\` is now at \`$tip\`."
+          done
