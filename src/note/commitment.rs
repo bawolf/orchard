@@ -66,6 +66,8 @@ impl NoteCommitment {
         // per-call `CommitDomain::new` reconstruction multiplier (two
         // `hash_to_curve`/SWU maps per rebuild under computed generators).
         let domain = note_commit_domain();
+        #[cfg(test)]
+        crate::spec::sinsemilla_tally::record_note_commit();
         domain
             .commit(
                 iter::empty()

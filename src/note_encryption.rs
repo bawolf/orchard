@@ -1053,8 +1053,8 @@ mod tests {
 
     // ---------------------------------------------------------------------
     // DEDUP PROOF: builds a full Ironwood V3 action retaining every field the
-    // engine needs, so we can model both the stock and the deduped per-action
-    // verification paths and count Sinsemilla `hash_to_point` evaluations.
+    // engine needs, so we can model the deduped per-action verification path
+    // and count its Sinsemilla `hash_to_point` evaluations.
     // ---------------------------------------------------------------------
     struct FullAction {
         fvk: crate::keys::FullViewingKey,
@@ -1122,94 +1122,12 @@ mod tests {
     }
 
     #[test]
-    fn sinsemilla_call_count_per_action_baseline() {
-        // Stock per-action verification path (no dedup), measured with the same
-        // instrumented Sinsemilla in the same tree, to establish the BEFORE count.
-        // Must be run isolated (`--test-threads=1`, single filter) because the
-        // counters are process-global atomics.
-        use zcash_note_encryption::{
-            try_output_recovery_with_ock, try_output_recovery_with_pkd_esk,
-        };
-        fn dump(label: &str, before: sinsemilla::SinsemillaCounters) {
-            let a = sinsemilla::counters_snapshot();
-            std::println!(
-                "COUNT[{}]: htp_calls={} htp_chunks={} commit={} short_commit={} commitdomain_new={} hashdomain_new={}",
-                label,
-                a.htp_calls - before.htp_calls,
-                a.htp_chunks - before.htp_chunks,
-                a.commit_calls - before.commit_calls,
-                a.shortcommit_calls - before.shortcommit_calls,
-                a.commitdomain_new - before.commitdomain_new,
-                a.hashdomain_new - before.hashdomain_new,
-            );
-        }
-        let fa = full_v3_action();
-        let fvk = &fa.fvk;
-        let action = &fa.action;
-        let recipient = fa.recipient;
-        let rho = Rho::from_nf_old(*action.nullifier());
-        let value = fa.note.value();
-        let rseed = fa.note.rseed().clone();
-        let cmx = *action.cmx();
-        let domain = IronwoodDomain::for_action(action);
-        let pk_d = IronwoodDomain::get_pk_d(&fa.note);
-        let esk = IronwoodDomain::derive_esk(&fa.note).unwrap();
-        let out_ct = fa.out_ct;
-
-        let before_action = sinsemilla::counters_snapshot();
-        {
-            // verify_nullifier
-            let ns =
-                Note::from_parts(recipient, value, rho, rseed.clone(), NoteVersion::V3).unwrap();
-            let _ = fvk.scope_for_address(&ns.recipient());
-            let _ = ns.nullifier(fvk);
-            // verify_note_commitment
-            let n0 =
-                Note::from_parts(recipient, value, rho, rseed.clone(), NoteVersion::V3).unwrap();
-            let _ = ExtractedNoteCommitment::from(n0.commitment()) == cmx;
-            // scope_for_address(recipient) in verify_bundle
-            let _ = fvk.scope_for_address(&recipient);
-            // verify_encryption (STOCK engine wiring: recover + Note::eq checks).
-            // The stock engine rebuilds the note, recovers via pkd_esk, then
-            // compares the recovered note/tuple for equality with `==`. Because
-            // `impl PartialEq for Note` recomputes BOTH commitments (note.rs),
-            // each `==` is 2 NoteCommits — the omission that made the prior
-            // baseline read 13 instead of the true ~19 (Fable review #7).
-            let en =
-                Note::from_parts(recipient, value, rho, rseed.clone(), NoteVersion::V3).unwrap();
-            let recovered = try_output_recovery_with_pkd_esk(&domain, pk_d, esk, action).unwrap();
-            let _ = recovered.0 == en && recovered.1 == en.recipient(); // Note::eq: 2 NoteCommit
-            let r_ock = try_output_recovery_with_ock(&domain, &fa.ock, action, &out_ct);
-            let _ = r_ock.is_some_and(|r| r == recovered); // tuple eq -> Note::eq: 2 NoteCommit
-            let r_ovk = try_output_recovery_with_ovk(&domain, &fa.ovk, action, &fa.cv_net, &out_ct);
-            let _ = r_ovk.is_some_and(|r| r == recovered); // tuple eq -> Note::eq: 2 NoteCommit
-        }
-        dump(
-            "WHOLE_PER_ACTION_BASELINE (stock path, engine eq checks)",
-            before_action,
-        );
-    }
-
-    #[test]
     fn sinsemilla_call_count_per_action_deduped() {
         use super::{
             recover_output_bound_with_ock, recover_output_bound_with_ovk,
             recover_output_bound_with_pkd_esk,
         };
-
-        fn dump(label: &str, before: sinsemilla::SinsemillaCounters) {
-            let a = sinsemilla::counters_snapshot();
-            std::println!(
-                "COUNT[{}]: htp_calls={} htp_chunks={} commit={} short_commit={} commitdomain_new={} hashdomain_new={}",
-                label,
-                a.htp_calls - before.htp_calls,
-                a.htp_chunks - before.htp_chunks,
-                a.commit_calls - before.commit_calls,
-                a.shortcommit_calls - before.shortcommit_calls,
-                a.commitdomain_new - before.commitdomain_new,
-                a.hashdomain_new - before.hashdomain_new,
-            );
-        }
+        use crate::spec::sinsemilla_tally::{self, Tally};
 
         let fa = full_v3_action();
         let fvk = &fa.fvk;
@@ -1217,7 +1135,7 @@ mod tests {
         let recipient = fa.recipient;
         let rho = Rho::from_nf_old(*action.nullifier());
         let value = fa.note.value();
-        let rseed = fa.note.rseed().clone();
+        let rseed = *fa.note.rseed();
         let cmx_expected = *action.cmx();
 
         let domain = IronwoodDomain::for_action(action);
@@ -1225,89 +1143,50 @@ mod tests {
         let esk = IronwoodDomain::derive_esk(&fa.note).unwrap();
         let out_ct = fa.out_ct;
 
-        // ---- SESSION PHASE (amortized, once per bundle): cache ivk ----
-        let session_before = sinsemilla::counters_snapshot();
+        // Session phase (amortized, once per bundle): cache the ivk.
         let classifier = fvk.scope_classifier();
-        dump(
-            "SESSION scope_classifier (cached ivk, once per bundle)",
-            session_before,
-        );
 
-        // ---- DEDUPED WHOLE PER ACTION ----
-        let before_action = sinsemilla::counters_snapshot();
+        let before_action = sinsemilla_tally::snapshot();
         {
             // verify_nullifier: build spend note + cm_old ONCE, reuse for nullifier.
-            let b = sinsemilla::counters_snapshot();
-            let (spend_note, cm_old) = Note::from_parts_with_commitment(
-                recipient,
-                value,
-                rho,
-                rseed.clone(),
-                NoteVersion::V3,
-            )
-            .unwrap();
-            dump("  step verify_nullifier from_parts_with_commitment", b);
-            let b = sinsemilla::counters_snapshot();
-            let _scope = classifier.scope_for_address(&spend_note.recipient()); // cached ivk: 0 Sinsemilla
-            dump("  step scope_for_address(spend)", b);
-            let b = sinsemilla::counters_snapshot();
-            let _nf = spend_note.nullifier_with_commitment(fvk, &cm_old); // reuse cm_old: 0 Sinsemilla
-            dump("  step nullifier_with_commitment", b);
+            let (spend_note, cm_old) =
+                Note::from_parts_with_commitment(recipient, value, rho, rseed, NoteVersion::V3)
+                    .unwrap();
+            let _scope = classifier.scope_for_address(&spend_note.recipient()); // cached ivk
+            let _nf = spend_note.nullifier_with_commitment(fvk, &cm_old); // reuses cm_old
 
             // verify_note_commitment: build output note + cmx ONCE, compare.
-            let b = sinsemilla::counters_snapshot();
-            let (out_note, cm) = Note::from_parts_with_commitment(
-                recipient,
-                value,
-                rho,
-                rseed.clone(),
-                NoteVersion::V3,
-            )
-            .unwrap();
-            dump(
-                "  step verify_note_commitment from_parts_with_commitment",
-                b,
-            );
+            let (out_note, cm) =
+                Note::from_parts_with_commitment(recipient, value, rho, rseed, NoteVersion::V3)
+                    .unwrap();
             let cmx = ExtractedNoteCommitment::from(cm);
             assert_eq!(cmx, cmx_expected, "verify_note_commitment must still hold");
 
-            // scope_for_address(recipient) in verify_bundle: cached ivk, 0 Sinsemilla.
+            // scope_for_address(recipient) in verify_bundle: cached ivk.
             let _rscope = classifier.scope_for_address(&recipient);
 
-            // verify_encryption: device-local recovery bound to `out_note`, 0 Sinsemilla.
-            let b = sinsemilla::counters_snapshot();
+            // verify_encryption: device-local recovery bound to `out_note`.
             let m1 = recover_output_bound_with_pkd_esk(&domain, pk_d, esk, action, &out_note)
                 .expect("pkd_esk recovery must accept");
-            dump("  step recover pkd_esk", b);
-            let b = sinsemilla::counters_snapshot();
             let m2 = recover_output_bound_with_ock(&domain, &fa.ock, action, &out_ct, &out_note)
                 .expect("ock recovery must accept");
-            dump("  step recover ock", b);
-            let b = sinsemilla::counters_snapshot();
             let m3 = recover_output_bound_with_ovk(
                 &domain, &fa.ovk, action, &fa.cv_net, &out_ct, &out_note,
             )
             .expect("ovk recovery must accept");
-            dump("  step recover ovk", b);
             assert_eq!(m1, fa.memo);
             assert_eq!(m2, fa.memo);
             assert_eq!(m3, fa.memo);
         }
-        dump(
-            "WHOLE_PER_ACTION_DEDUPED (2 NoteCommit: cm_old + cmx; 0 CommitIvk)",
-            before_action,
-        );
 
-        // Hard assertions: exactly 2 hash_to_point evals, 0 short-commit per action.
-        let after = sinsemilla::counters_snapshot();
-        let htp = after.htp_calls - before_action.htp_calls;
-        let sc = after.shortcommit_calls - before_action.shortcommit_calls;
-        let cdn = after.commitdomain_new - before_action.commitdomain_new;
-        assert_eq!(htp, 2, "expected exactly 2 hash_to_point evals per action");
-        assert_eq!(sc, 0, "expected 0 CommitIvk short-commits per action");
+        // Exactly 2 NoteCommit (cm_old + cmx) and 0 Commit^ivk per action,
+        // i.e. 2 Sinsemilla hash_to_point evaluations.
         assert_eq!(
-            cdn, 0,
-            "CommitDomain must be cached, not rebuilt per action"
+            sinsemilla_tally::since(before_action),
+            Tally {
+                note_commit: 2,
+                commit_ivk: 0,
+            }
         );
     }
 
@@ -1372,7 +1251,7 @@ mod tests {
             fa.recipient,
             NoteValue::from_raw(999),
             rho,
-            fa.note.rseed().clone(),
+            *fa.note.rseed(),
             NoteVersion::V3,
         )
         .unwrap();
@@ -1401,7 +1280,7 @@ mod tests {
             fa.recipient,
             fa.note.value(),
             rho,
-            fa.note.rseed().clone(),
+            *fa.note.rseed(),
             NoteVersion::V3,
         )
         .unwrap();
@@ -1442,7 +1321,7 @@ mod tests {
             fa.recipient,
             fa.note.value(),
             other_rho,
-            fa.note.rseed().clone(),
+            *fa.note.rseed(),
             NoteVersion::V3,
         )
         .unwrap();

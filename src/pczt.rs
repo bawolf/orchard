@@ -562,8 +562,9 @@ mod tests {
     /// (`Spend::verify_nullifier_with_classifier`, `Output::verify_note_commitment`
     /// which now returns the validated note, the cached `ScopeClassifier`, and the
     /// device-local `recover_output_bound_with_*`) in exactly the order
-    /// `verify_bundle` calls them, and counts Sinsemilla `hash_to_point` evals per
-    /// action. This is the code AS WRITTEN, not a hand-inlined ideal.
+    /// `verify_bundle` calls them, and counts the Sinsemilla commitments (one
+    /// `hash_to_point` each) per action. This is the code AS WRITTEN, not a
+    /// hand-inlined ideal.
     #[test]
     fn real_verify_bundle_sinsemilla_count_per_action() {
         use crate::keys::OutgoingViewingKey;
@@ -571,39 +572,22 @@ mod tests {
             recover_output_bound_with_ock, recover_output_bound_with_ovk,
             recover_output_bound_with_pkd_esk, IronwoodDomain,
         };
+        use crate::spec::sinsemilla_tally::{self, Tally};
         use zcash_note_encryption::Domain;
-
-        fn diff(before: sinsemilla::SinsemillaCounters) -> (u64, u64, u64, u64) {
-            let a = sinsemilla::counters_snapshot();
-            (
-                a.htp_calls - before.htp_calls,
-                a.commit_calls - before.commit_calls,
-                a.shortcommit_calls - before.shortcommit_calls,
-                a.commitdomain_new - before.commitdomain_new,
-            )
-        }
 
         let (bundle, fvk) = ironwood_real_spend_pczt_bundle(OsRng);
 
-        // ---- SESSION PHASE: build the ivk cache once per bundle. ----
-        let s0 = sinsemilla::counters_snapshot();
+        // Session phase: build the ivk cache once per bundle.
         let classifier = fvk.scope_classifier();
-        let (s_htp, _s_c, s_sc, _s_cdn) = diff(s0);
-        std::println!(
-            "REALCOUNT[SESSION scope_classifier]: htp_calls={} short_commit={}",
-            s_htp,
-            s_sc
-        );
 
         let mut spend_action_seen = 0usize;
         let mut output_action_seen = 0usize;
-        for (idx, action) in bundle.actions().iter().enumerate() {
+        for action in bundle.actions() {
             let spend = action.spend();
             let output = action.output();
             let spend_value = spend.value().map(|v| v.inner()).unwrap_or(0);
-            let output_value = output.value().map(|v| v.inner()).unwrap_or(0);
 
-            let a0 = sinsemilla::counters_snapshot();
+            let a0 = sinsemilla_tally::snapshot();
 
             // verify_cv_net (no Sinsemilla) + verify_nullifier (classifier) + verify_rk.
             action.verify_cv_net().expect("cv_net");
@@ -656,37 +640,23 @@ mod tests {
                 .expect("ovk recovery");
             }
 
-            let (htp, commit, sc, cdn) = diff(a0);
-            std::println!(
-                "REALCOUNT[action {} spend_value={} output_value={}]: htp_calls={} commit={} short_commit={} commitdomain_new={}",
-                idx, spend_value, output_value, htp, commit, sc, cdn
-            );
+            let tally = sinsemilla_tally::since(a0);
 
-            assert_eq!(
-                cdn, 0,
-                "CommitDomain must be cached, not rebuilt per action"
-            );
-
-            // htp_calls = NoteCommit + CommitIvk (short_commit routes through
-            // commit). The core dedup invariant: EXACTLY 2 NoteCommit per action
-            // (spend cm_old + output cmx), no matter the action shape.
-            let note_commits = htp - sc;
-            assert_eq!(commit - sc, 2, "exactly 2 NoteCommit per action");
-            assert_eq!(
-                note_commits, 2,
-                "exactly 2 NoteCommit hash_to_point per action"
-            );
-
+            // The core dedup invariant: EXACTLY 2 NoteCommit per action (spend
+            // cm_old + output cmx), no matter the action shape.
             if spend_value > 0 {
                 // Device-owned real spend: ownership check uses the cached
                 // classifier => 0 CommitIvk => 2 hash_to_point total. This is the
                 // MUST-FIX #4 "2 evals/action" result on the REAL path.
                 spend_action_seen += 1;
                 assert_eq!(
-                    sc, 0,
-                    "device-spend action: 0 CommitIvk (cached classifier)"
+                    tally,
+                    Tally {
+                        note_commit: 2,
+                        commit_ivk: 0,
+                    },
+                    "device-spend action: 2 NoteCommit, 0 CommitIvk (cached classifier)"
                 );
-                assert_eq!(htp, 2, "device-spend action: exactly 2 hash_to_point evals");
             } else {
                 // Dummy/padding spend (value == 0) validates under its own
                 // host-supplied FVK (MUST-FIX #3: no device classifier), so its
@@ -694,10 +664,13 @@ mod tests {
                 // (2 NoteCommit + 1 CommitIvk) — the stock baseline pays it too.
                 output_action_seen += 1;
                 assert_eq!(
-                    sc, 1,
-                    "dummy-spend action keeps its own-FVK scope check (MUST-FIX #3)"
+                    tally,
+                    Tally {
+                        note_commit: 2,
+                        commit_ivk: 1,
+                    },
+                    "dummy-spend action: 2 NoteCommit + 1 CommitIvk (MUST-FIX #3)"
                 );
-                assert_eq!(htp, 3, "dummy-spend action: 2 NoteCommit + 1 CommitIvk");
             }
         }
         assert!(

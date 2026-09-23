@@ -240,6 +240,8 @@ pub(crate) fn commit_ivk(
     // DEDUP LEVER 2: cache the CommitIvk `CommitDomain` generators (see
     // `commit_ivk_domain`) instead of rebuilding them per call.
     let domain = commit_ivk_domain();
+    #[cfg(test)]
+    sinsemilla_tally::record_commit_ivk();
     domain.short_commit(
         iter::empty()
             .chain(ak.to_le_bits().iter().by_vals().take(L_ORCHARD_BASE))
@@ -254,6 +256,54 @@ fn commit_ivk_domain() -> &'static sinsemilla::CommitDomain {
     use once_cell::race::OnceBox;
     static DOMAIN: OnceBox<sinsemilla::CommitDomain> = OnceBox::new();
     DOMAIN.get_or_init(|| Box::new(sinsemilla::CommitDomain::new(COMMIT_IVK_PERSONALIZATION)))
+}
+
+/// Test-only tally of the Sinsemilla commitments evaluated on the current thread.
+///
+/// Each `NoteCommit` and each `Commit^ivk` is exactly one Sinsemilla
+/// `hash_to_point`, so tests use these counts to pin how many a verification
+/// path performs. The counters are thread-local, so tests running in parallel
+/// do not see each other's calls.
+#[cfg(test)]
+pub(crate) mod sinsemilla_tally {
+    extern crate std;
+
+    use core::cell::Cell;
+
+    std::thread_local! {
+        static NOTE_COMMIT: Cell<u32> = const { Cell::new(0) };
+        static COMMIT_IVK: Cell<u32> = const { Cell::new(0) };
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) struct Tally {
+        pub(crate) note_commit: u32,
+        pub(crate) commit_ivk: u32,
+    }
+
+    pub(crate) fn record_note_commit() {
+        NOTE_COMMIT.with(|n| n.set(n.get() + 1));
+    }
+
+    pub(crate) fn record_commit_ivk() {
+        COMMIT_IVK.with(|n| n.set(n.get() + 1));
+    }
+
+    pub(crate) fn snapshot() -> Tally {
+        Tally {
+            note_commit: NOTE_COMMIT.with(Cell::get),
+            commit_ivk: COMMIT_IVK.with(Cell::get),
+        }
+    }
+
+    /// The commitments evaluated on this thread since `before` was taken.
+    pub(crate) fn since(before: Tally) -> Tally {
+        let now = snapshot();
+        Tally {
+            note_commit: now.note_commit - before.note_commit,
+            commit_ivk: now.commit_ivk - before.commit_ivk,
+        }
+    }
 }
 
 /// Defined in [Zcash Protocol Spec § 5.4.1.6: DiversifyHash^Sapling and DiversifyHash^Orchard Hash Functions][concretediversifyhash].
