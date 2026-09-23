@@ -7,11 +7,44 @@ and this project adheres to Rust's notion of
 
 ## [Unreleased]
 
+### Added
+- `orchard::pczt::Action::decrypt_output_with_ivk`
+- `orchard::pczt::Action::decrypt_compact_output_with_ivk`
+- `orchard::pczt::Action::recover_output_with_ovk`
+- `orchard::pczt::UnsupportedBundleVersion`
+- `impl From<&orchard::pczt::Action> for orchard::note_encryption::CompactAction`
+
 ### Changed
+- MSRV is now 1.88
 - `orchard::keys::FullViewingKey::scope_for_address` now reconstructs the candidate
   address directly from the address's diversifier for each scope instead of recovering
   and re-encrypting the diversifier index. The result is unchanged; the FF1 index
   recovery is no longer on this call path.
+
+## [0.15.5] - 2026-08-02
+
+### Changed
+- The minimum `halo2_proofs` version is now 0.3.5, which provides the
+  match-only fixture exporter used by the random `verifier-fingerprint`
+  captures.
+
+## [0.15.4] - 2026-07-23
+
+### Changed
+- Batched trial decryption (the `zcash_note_encryption::batch` APIs) is
+  significantly faster. Ephemeral keys are now prepared with GLV endomorphism
+  windows built across the whole batch with a single shared normalization, and
+  each viewing key's GLV decomposition is computed once per batch and reused
+  against every ephemeral key. The GLV primitive lives in `pasta_curves::glv`
+  (`Table` / `Decomposed` / `Table::mul_decomposed`); orchard consumes it
+  through the `BatchDomain::batch_ka_agree_dec` hook added in
+  `zcash_note_encryption` 0.4.2. Shared secrets are unchanged (byte-identical
+  to the per-item path), and the per-output decryption entry points are
+  unaffected. Like the existing `group::Wnaf`-based preparation, the new path
+  is variable-time with respect to the (wallet-local) viewing key scalar.
+- MSRV-compatible bump: the minimum `zcash_note_encryption` version is now 0.4.2.
+- MSRV-compatible bump: the minimum `pasta_curves` version is now 0.5.2, and its
+  `glv` feature is now enabled (providing `pasta_curves::glv`).
 
 ## [0.15.3] - 2026-07-22
 

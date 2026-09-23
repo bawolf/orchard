@@ -8,14 +8,19 @@
 //!
 //! Two limitations are load-bearing for anyone consuming the exported fixtures:
 //!
-//! * **Only accepting runs are exported to Lean.** The negative captures in `rejected` confirm in
-//!   Rust that a tampered/short/desynchronized proof assembles a non-identity MSM and is rejected by
-//!   the deployed verifier, but they are never handed to Lean. `MsmMatch` pins the full coefficient
-//!   structure of accepting runs — not merely acceptance — so a trivially-accepting Lean `assemble`
-//!   would already fail it; the narrower unchecked residual is a Lean `assemble` that agrees on
-//!   accepting runs yet mismodels the rejection paths. This is by design: the Halo2 exporter fails
-//!   fast on a non-identity capture rather than emitting a rejecting fixture, so negative-path
-//!   coverage stays in Rust.
+//! * **Honest-run captures are blind off the honest locus; random captures cover the rest.** The
+//!   honest captures export accepting runs only: the Halo2 honest exporter fails fast on a
+//!   non-identity capture, and the negative captures in `rejected` confirm in Rust that a
+//!   tampered/short/desynchronized proof assembles a non-identity MSM and is rejected by the
+//!   deployed verifier without being handed to Lean. `MsmMatch` pins the full coefficient
+//!   structure of those accepting runs — not merely acceptance — so a trivially-accepting Lean
+//!   `assemble` would already fail it. The residual an honest capture cannot see — a Lean
+//!   `assemble` that agrees at honest proofs yet diverges elsewhere (e.g. recomputing a
+//!   transcript-claimed evaluation instead of reading it) — is covered by the `random` captures:
+//!   the deployed verifier run on a random proof string, exported *match-only* (deliberately
+//!   non-accepting, no eval theorem; seeds `0x52`/`0x72`/`0x33`, ASCII `R`/`r`/`3`,
+//!   nothing-up-my-sleeve). What stays Rust-only is rejection-path modeling: which inputs reach
+//!   the MSM at all.
 //! * **The exported Fiat–Shamir schedule is not injective with respect to real transcripts.** The
 //!   dumper models each squeeze by appending the challenge as a `TranscriptElt.scalar`, the same
 //!   constructor used for proof-read scalars, whereas the deployed Blake2b transcript uses a
@@ -39,6 +44,7 @@ use crate::{
     tree::MerkleHashOrchard,
 };
 
+mod random;
 mod rejected;
 
 fn fixture_rng(seed: u8) -> ChaCha20Rng {
@@ -180,5 +186,69 @@ fn fingerprint_capture_two_actions() {
         2,
         "Zcash.Snark.Fixture2",
         "ORCHARD_LEAN_MULTI_FIXTURE_OUT",
+    );
+}
+
+/// Regenerate the deterministic single-action random match-only fixture (see `random`) with:
+///
+/// ```text
+/// ORCHARD_LEAN_SINGLE_RANDOM_FIXTURE_OUT=/path/to/ironwood/Zcash/Snark/Fixtures/SingleActionRandom/Fixture.lean \
+///   cargo test --features verifier-fingerprint \
+///     circuit::fingerprint::fingerprint_capture_random -- --exact
+/// ```
+///
+/// `ORCHARD_LEAN_SINGLE_RANDOM_PROOF_OUT` additionally writes the fabricated proof byte string as
+/// hex (a non-Lean sibling artifact for byte-level decode modeling).
+#[test]
+fn fingerprint_capture_random() {
+    random::capture_random_fixture(
+        0x52,
+        1,
+        "Zcash.Snark.FixtureRandom",
+        "ORCHARD_LEAN_SINGLE_RANDOM_FIXTURE_OUT",
+        "ORCHARD_LEAN_SINGLE_RANDOM_PROOF_OUT",
+    );
+}
+
+/// Regenerate the deterministic two-action random match-only fixture (see `random`) with:
+///
+/// ```text
+/// ORCHARD_LEAN_MULTI_RANDOM_FIXTURE_OUT=/path/to/ironwood/Zcash/Snark/Fixtures/MultiActionRandom/Fixture.lean \
+///   cargo test --features verifier-fingerprint \
+///     circuit::fingerprint::fingerprint_capture_random_two_actions -- --exact
+/// ```
+///
+/// `ORCHARD_LEAN_MULTI_RANDOM_PROOF_OUT` additionally writes the fabricated proof byte string as
+/// hex.
+#[test]
+fn fingerprint_capture_random_two_actions() {
+    random::capture_random_fixture(
+        0x72,
+        2,
+        "Zcash.Snark.FixtureRandom2",
+        "ORCHARD_LEAN_MULTI_RANDOM_FIXTURE_OUT",
+        "ORCHARD_LEAN_MULTI_RANDOM_PROOF_OUT",
+    );
+}
+
+/// Regenerate the deterministic three-action random match-only fixture (see `random`) with:
+///
+/// ```text
+/// ORCHARD_LEAN_TRIPLE_RANDOM_FIXTURE_OUT=/path/to/ironwood/Zcash/Snark/Fixtures/TripleActionRandom/Fixture.lean \
+///   cargo test --features verifier-fingerprint \
+///     circuit::fingerprint::fingerprint_capture_random_three_actions -- --exact
+/// ```
+///
+/// `ORCHARD_LEAN_TRIPLE_RANDOM_PROOF_OUT` additionally writes the fabricated proof byte string as
+/// hex. Whether this shape is ingested by Ironwood is a build-cost decision made there; the
+/// capture exists so deployed-side action-count uniformity can be tested without new Rust work.
+#[test]
+fn fingerprint_capture_random_three_actions() {
+    random::capture_random_fixture(
+        0x33,
+        3,
+        "Zcash.Snark.FixtureRandom3",
+        "ORCHARD_LEAN_TRIPLE_RANDOM_FIXTURE_OUT",
+        "ORCHARD_LEAN_TRIPLE_RANDOM_PROOF_OUT",
     );
 }
