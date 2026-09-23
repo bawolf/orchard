@@ -122,10 +122,10 @@ jobs:
         run: |
           set -euo pipefail
           # The crate carries rust-toolchain.toml, so plain `cargo ...` resolves
-          # to the pinned channel with clippy + rustfmt. `rustup show` installs it.
-          # Note: an upstream merge may raise that pin (upstream is moving to
-          # 1.88); that is fine, this step follows the file.
-          rustup show
+          # to the pinned channel with clippy + rustfmt. With no argument,
+          # `rustup toolchain install` installs that channel (`rustup show` no
+          # longer does). An upstream merge may raise the pin; this follows it.
+          rustup toolchain install
           rustup toolchain install "$PINNED_NIGHTLY" --profile minimal --target "$NOSTD_TARGET"
           cargo --version
           rustc "+$PINNED_NIGHTLY" --version
@@ -211,25 +211,19 @@ jobs:
             fi
           }
 
-          # Every gate below was verified green locally at 0b04326 on 2026-09-22.
-          # Only add a gate here after it passes at HEAD, so a red run always
-          # means "upstream broke us", never "this gate was already broken".
-          #
-          # DELIBERATELY ABSENT: `cargo test`, and `cargo clippy --all-targets`.
-          # Both fail at 0b04326 for a reason that has nothing to do with
-          # upstream: the `#[cfg(test)]` instrumentation added in 5f527f8
-          # ("perf(pczt): Sinsemilla dedup on the verify path") calls
-          # `sinsemilla::counters_snapshot()` and names
-          # `sinsemilla::SinsemillaCounters`, and neither symbol exists in
-          # sinsemilla 0.1.0 from crates.io *or* in bawolf/sinsemilla@6ca88ff.
-          # The orchard test target therefore does not compile today. See the
-          # advisory step below; once the counters land in the sinsemilla fork
-          # (or the instrumentation is removed), promote `cargo test` into this
-          # matrix -- it is the gate we most want here.
+          # Every gate below was verified green locally at 0b04326 on 2026-09-22,
+          # except `test` and `clippy:all-targets`, which went green on
+          # 2026-09-23 once the test target compiled again (the dedup tests
+          # count Sinsemilla commitments with orchard's own test-only tally
+          # instead of a sinsemilla API that never existed). Only add a gate
+          # here after it passes at HEAD, so a red run always means "upstream
+          # broke us", never "this gate was already broken".
           run_gate "fmt"                 cargo fmt --check
           run_gate "check"               cargo check
           run_gate "check:all-features"  cargo check --all-features
           run_gate "clippy:lib"          cargo clippy --all-features -- -D warnings
+          run_gate "clippy:all-targets"  cargo clippy --all-targets --all-features -- -D warnings
+          run_gate "test"                cargo test
           run_gate "test:doc"            cargo test --doc
           run_gate "check:benches"       cargo check --benches
           # Bare-metal build for the Safe 5 core, with the firmware's exact
@@ -250,17 +244,6 @@ jobs:
             echo "STAGE=gate failure after a clean merge" >> "$GITHUB_ENV"
             exit 1
           fi
-
-      # Advisory, NOT blocking -- see the long comment in the gate matrix above.
-      # When this step goes green, delete `continue-on-error` and move
-      # `cargo test` / `cargo clippy --all-targets` into the blocking matrix.
-      - name: Full test + clippy (advisory -- test target does not compile at 0b04326)
-        if: steps.merge.outputs.merged == 'yes'
-        continue-on-error: true
-        run: |
-          set -uo pipefail
-          cargo test
-          cargo clippy --all-targets --all-features -- -D warnings
 
       - name: Push the merge to our branch
         if: steps.merge.outputs.merged == 'yes'
