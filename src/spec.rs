@@ -208,21 +208,26 @@ pub(crate) fn mod_r_p(x: pallas::Base) -> pallas::Scalar {
 /// Defined in [Zcash Protocol Spec § 5.4.8.4: Sinsemilla commitments][concretesinsemillacommit].
 ///
 /// [concretesinsemillacommit]: https://zips.z.cash/protocol/protocol.pdf#concretesinsemillacommit
+///
+/// `progress` is called after each piece of the Sinsemilla hash (see
+/// [`sinsemilla::HashDomain::hash_to_point_with_progress`]).
 pub(crate) fn commit_ivk(
     ak: &pallas::Base,
     nk: &pallas::Base,
     rivk: &pallas::Scalar,
+    progress: &mut dyn FnMut(),
 ) -> CtOption<pallas::Base> {
     // We rely on the API contract that to_le_bits() returns at least PrimeField::NUM_BITS
     // bits, which is equal to L_ORCHARD_BASE.
     // DEDUP LEVER 2: cache the CommitIvk `CommitDomain` generators (see
     // `commit_ivk_domain`) instead of rebuilding them per call.
     let domain = commit_ivk_domain();
-    domain.short_commit(
+    domain.short_commit_with_progress(
         iter::empty()
             .chain(ak.to_le_bits().iter().by_vals().take(L_ORCHARD_BASE))
             .chain(nk.to_le_bits().iter().by_vals().take(L_ORCHARD_BASE)),
         rivk,
+        progress,
     )
 }
 

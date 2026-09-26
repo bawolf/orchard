@@ -50,6 +50,9 @@ impl NoteCommitment {
     /// Defined in [Zcash Protocol Spec § 5.4.8.4: Sinsemilla commitments][concretesinsemillacommit].
     ///
     /// [concretesinsemillacommit]: https://zips.z.cash/protocol/nu5.pdf#concretesinsemillacommit
+    ///
+    /// `progress` is called after each piece of the Sinsemilla hash (see
+    /// [`sinsemilla::HashDomain::hash_to_point_with_progress`]).
     pub(super) fn derive(
         g_d: [u8; 32],
         pk_d: [u8; 32],
@@ -57,6 +60,7 @@ impl NoteCommitment {
         rho: pallas::Base,
         psi: pallas::Base,
         rcm: NoteCommitTrapdoor,
+        progress: &mut dyn FnMut(),
     ) -> CtOption<Self> {
         // DEDUP LEVER 2: cache the `CommitDomain` (and its Sinsemilla `Q`/`R`
         // generators) once for the whole process instead of rebuilding it on
@@ -67,7 +71,7 @@ impl NoteCommitment {
         // `hash_to_curve`/SWU maps per rebuild under computed generators).
         let domain = note_commit_domain();
         domain
-            .commit(
+            .commit_with_progress(
                 iter::empty()
                     .chain(BitArray::<_, Lsb0>::new(g_d).iter().by_vals())
                     .chain(BitArray::<_, Lsb0>::new(pk_d).iter().by_vals())
@@ -75,6 +79,7 @@ impl NoteCommitment {
                     .chain(rho.to_le_bits().iter().by_vals().take(L_ORCHARD_BASE))
                     .chain(psi.to_le_bits().iter().by_vals().take(L_ORCHARD_BASE)),
                 &rcm.0,
+                progress,
             )
             .map(NoteCommitment)
     }

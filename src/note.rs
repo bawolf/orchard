@@ -283,6 +283,19 @@ impl Note {
         rseed: RandomSeed,
         version: NoteVersion,
     ) -> CtOption<Self> {
+        Self::from_parts_with_progress(recipient, value, rho, rseed, version, &mut || {})
+    }
+
+    /// [`Note::from_parts`], calling `progress` after each piece of its NoteCommit
+    /// Sinsemilla hash (see [`sinsemilla::HashDomain::hash_to_point_with_progress`]).
+    pub fn from_parts_with_progress(
+        recipient: Address,
+        value: NoteValue,
+        rho: Rho,
+        rseed: RandomSeed,
+        version: NoteVersion,
+        progress: &mut dyn FnMut(),
+    ) -> CtOption<Self> {
         let note = Note {
             recipient,
             value,
@@ -290,7 +303,7 @@ impl Note {
             rseed,
             version,
         };
-        CtOption::new(note, note.commitment_inner().is_some())
+        CtOption::new(note, note.commitment_inner(progress).is_some())
     }
 
     /// Creates a `Note` from its component parts, returning both the note and
@@ -301,13 +314,15 @@ impl Note {
     /// need the commitment (`verify_note_commitment`, nullifier derivation)
     /// pay for a second identical Sinsemilla evaluation. This variant returns
     /// the commitment that was already computed, so the caller derives the
-    /// note commitment exactly once.
+    /// note commitment exactly once. `progress` is called as
+    /// [`Note::from_parts_with_progress`] does.
     pub fn from_parts_with_commitment(
         recipient: Address,
         value: NoteValue,
         rho: Rho,
         rseed: RandomSeed,
         version: NoteVersion,
+        progress: &mut dyn FnMut(),
     ) -> Option<(Self, NoteCommitment)> {
         let note = Note {
             recipient,
@@ -317,7 +332,7 @@ impl Note {
             version,
         };
         // Compute the commitment exactly once and hand it back to the caller.
-        let cm = Option::<NoteCommitment>::from(note.commitment_inner())?;
+        let cm = Option::<NoteCommitment>::from(note.commitment_inner(progress))?;
         Some((note, cm))
     }
 
@@ -433,7 +448,7 @@ impl Note {
     /// [notes]: https://zips.z.cash/protocol/nu5.pdf#notes
     pub fn commitment(&self) -> NoteCommitment {
         // `Note` will always have a note commitment by construction.
-        self.commitment_inner().unwrap()
+        self.commitment_inner(&mut || {}).unwrap()
     }
 
     /// Derives the commitment to this note.
@@ -445,7 +460,7 @@ impl Note {
     /// Defined in [Zcash Protocol Spec § 3.2: Notes][notes].
     ///
     /// [notes]: https://zips.z.cash/protocol/nu5.pdf#notes
-    fn commitment_inner(&self) -> CtOption<NoteCommitment> {
+    fn commitment_inner(&self, progress: &mut dyn FnMut()) -> CtOption<NoteCommitment> {
         let g_d = self.recipient.g_d();
         let g_d_bytes = g_d.to_bytes();
         let pk_d = self.recipient.pk_d().inner();
@@ -459,6 +474,7 @@ impl Note {
             self.rho.0,
             psi,
             self.rcm(),
+            progress,
         )
     }
 
@@ -580,12 +596,28 @@ mod tests {
         let rho_inner = rho.into_inner();
         let value = NoteValue::from_raw(tv.note_v);
 
-        let cmx_old =
-            NoteCommitment::derive(g_d_bytes, pk_d_bytes, value, rho_inner, psi, rcm_old).unwrap();
+        let cmx_old = NoteCommitment::derive(
+            g_d_bytes,
+            pk_d_bytes,
+            value,
+            rho_inner,
+            psi,
+            rcm_old,
+            &mut || {},
+        )
+        .unwrap();
         let cmx_old_bytes = ExtractedNoteCommitment::from(cmx_old).to_bytes();
 
-        let cmx_qr =
-            NoteCommitment::derive(g_d_bytes, pk_d_bytes, value, rho_inner, psi, rcm_new).unwrap();
+        let cmx_qr = NoteCommitment::derive(
+            g_d_bytes,
+            pk_d_bytes,
+            value,
+            rho_inner,
+            psi,
+            rcm_new,
+            &mut || {},
+        )
+        .unwrap();
         let cmx_qr_bytes = ExtractedNoteCommitment::from(cmx_qr).to_bytes();
 
         QrRcmDerivation {

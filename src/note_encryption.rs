@@ -1210,6 +1210,7 @@ mod tests {
                 rho,
                 rseed.clone(),
                 NoteVersion::V3,
+                &mut || {},
             )
             .unwrap();
             dump("  step verify_nullifier from_parts_with_commitment", b);
@@ -1228,6 +1229,7 @@ mod tests {
                 rho,
                 rseed.clone(),
                 NoteVersion::V3,
+                &mut || {},
             )
             .unwrap();
             dump(
@@ -1369,6 +1371,7 @@ mod tests {
             rho,
             fa.note.rseed().clone(),
             NoteVersion::V3,
+            &mut || {},
         )
         .unwrap();
         let cmx = ExtractedNoteCommitment::from(cm);

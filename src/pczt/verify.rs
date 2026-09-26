@@ -132,8 +132,9 @@ impl super::Spend {
 
     /// [`Spend::verify_nullifier_with_classifier`], calling `progress` between its
     /// three expensive steps (the spent note's commitment, the FVK-ownership check
-    /// and the nullifier derivation), for a caller on a slow device that must
-    /// report progress while it runs. The checks are unchanged.
+    /// and the nullifier derivation) and during their Sinsemilla hashes, for a
+    /// caller on a slow device that must report progress while it runs. The checks
+    /// are unchanged.
     pub fn verify_nullifier_with_progress(
         &self,
         expected_fvk: Option<&FullViewingKey>,
@@ -151,6 +152,7 @@ impl super::Spend {
             self.rho.ok_or(VerifyError::MissingRho)?,
             self.rseed.ok_or(VerifyError::MissingRandomSeed)?,
             self.note_version,
+            progress,
         )
         .ok_or(VerifyError::InvalidSpendNote)?;
         progress();
@@ -163,7 +165,9 @@ impl super::Spend {
         // `Commit^ivk` derivation on their own host-supplied FVK.
         let owned = match (classifier, expected_fvk) {
             (Some(c), Some(exp)) if fvk == exp => c.scope_for_address(&note.recipient()).is_some(),
-            _ => fvk.scope_for_address(&note.recipient()).is_some(),
+            _ => fvk
+                .scope_for_address_with_progress(&note.recipient(), progress)
+                .is_some(),
         };
         if !owned {
             return Err(VerifyError::WrongFvkForNote);
@@ -213,6 +217,19 @@ impl super::Output {
     ///
     /// `spend` must be the Spend from the same Orchard action.
     pub fn verify_note_commitment(&self, spend: &super::Spend) -> Result<Note, VerifyError> {
+        self.verify_note_commitment_with_progress(spend, &mut || {})
+    }
+
+    /// [`Output::verify_note_commitment`], calling `progress` after each piece of the
+    /// note's NoteCommit Sinsemilla hash (see
+    /// [`sinsemilla::HashDomain::hash_to_point_with_progress`]).
+    ///
+    /// [`Output::verify_note_commitment`]: super::Output::verify_note_commitment
+    pub fn verify_note_commitment_with_progress(
+        &self,
+        spend: &super::Spend,
+        progress: &mut dyn FnMut(),
+    ) -> Result<Note, VerifyError> {
         // DEDUP LEVER 1: derive the output note commitment `cmx` exactly once
         // (from `from_parts_with_commitment`) instead of once for the
         // constructibility check and again in `note.commitment()`.
@@ -229,6 +246,7 @@ impl super::Output {
             Rho::from_nf_old(spend.nullifier),
             self.rseed.ok_or(VerifyError::MissingRandomSeed)?,
             self.note_version,
+            progress,
         )
         .ok_or(VerifyError::InvalidOutputNote)?;
 

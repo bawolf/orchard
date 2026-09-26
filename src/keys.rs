@@ -70,6 +70,13 @@ impl SpendingKey {
     ///
     /// Returns `None` if the bytes do not correspond to a valid Orchard spending key.
     pub fn from_bytes(sk: [u8; 32]) -> CtOption<Self> {
+        Self::from_bytes_with_progress(sk, &mut || {})
+    }
+
+    /// [`SpendingKey::from_bytes`], calling `progress` after each piece of its two
+    /// `Commit^ivk` Sinsemilla hashes (see
+    /// [`sinsemilla::HashDomain::hash_to_point_with_progress`]).
+    pub fn from_bytes_with_progress(sk: [u8; 32], progress: &mut dyn FnMut()) -> CtOption<Self> {
         let sk = SpendingKey(sk);
         // If ask = 0, discard this key. We call `derive_inner` rather than
         // `SpendAuthorizingKey::from` here because we only need to know
@@ -78,8 +85,8 @@ impl SpendingKey {
         let ask = SpendAuthorizingKey::derive_inner(&sk);
         // If ivk is 0 or ⊥, discard this key.
         let fvk = (&sk).into();
-        let external_ivk = KeyAgreementPrivateKey::derive_inner(&fvk);
-        let internal_ivk = KeyAgreementPrivateKey::derive_inner(&fvk.derive_internal());
+        let external_ivk = KeyAgreementPrivateKey::derive_inner(&fvk, progress);
+        let internal_ivk = KeyAgreementPrivateKey::derive_inner(&fvk.derive_internal(), progress);
         CtOption::new(
             sk,
             !(ask.is_zero() | external_ivk.is_none() | internal_ivk.is_none()),
@@ -384,10 +391,22 @@ impl FullViewingKey {
 
     /// Returns the payment address for this key corresponding to the given diversifier.
     pub fn address(&self, d: Diversifier, scope: Scope) -> Address {
+        self.address_with_progress(d, scope, &mut || {})
+    }
+
+    /// [`FullViewingKey::address`], calling `progress` after each piece of its
+    /// `Commit^ivk` Sinsemilla hash (see
+    /// [`sinsemilla::HashDomain::hash_to_point_with_progress`]).
+    pub fn address_with_progress(
+        &self,
+        d: Diversifier,
+        scope: Scope,
+        progress: &mut dyn FnMut(),
+    ) -> Address {
         // Shortcut: we don't need to derive DiversifierKey.
         match scope {
-            Scope::External => KeyAgreementPrivateKey::from_fvk(self),
-            Scope::Internal => KeyAgreementPrivateKey::from_fvk(&self.derive_internal()),
+            Scope::External => KeyAgreementPrivateKey::from_fvk(self, progress),
+            Scope::Internal => KeyAgreementPrivateKey::from_fvk(&self.derive_internal(), progress),
         }
         .address(d)
     }
@@ -395,9 +414,21 @@ impl FullViewingKey {
     /// Returns the scope of the given address, or `None` if the address is not derived
     /// from this full viewing key.
     pub fn scope_for_address(&self, address: &Address) -> Option<Scope> {
+        self.scope_for_address_with_progress(address, &mut || {})
+    }
+
+    /// [`FullViewingKey::scope_for_address`], calling `progress` as
+    /// [`FullViewingKey::address_with_progress`] does.
+    pub(crate) fn scope_for_address_with_progress(
+        &self,
+        address: &Address,
+        progress: &mut dyn FnMut(),
+    ) -> Option<Scope> {
         [Scope::External, Scope::Internal]
             .into_iter()
-            .find(|scope| &self.address(address.diversifier(), *scope) == address)
+            .find(|scope| {
+                &self.address_with_progress(address.diversifier(), *scope, progress) == address
+            })
     }
 
     /// Builds a [`ScopeClassifier`] that derives the external and internal
@@ -411,9 +442,16 @@ impl FullViewingKey {
     /// constant, deriving it once per session removes all per-action
     /// `Commit^ivk` Sinsemilla evaluations.
     pub fn scope_classifier(&self) -> ScopeClassifier {
+        self.scope_classifier_with_progress(&mut || {})
+    }
+
+    /// [`FullViewingKey::scope_classifier`], calling `progress` after each piece of
+    /// its two `Commit^ivk` Sinsemilla hashes (see
+    /// [`sinsemilla::HashDomain::hash_to_point_with_progress`]).
+    pub fn scope_classifier_with_progress(&self, progress: &mut dyn FnMut()) -> ScopeClassifier {
         ScopeClassifier {
-            external: KeyAgreementPrivateKey::from_fvk(self),
-            internal: KeyAgreementPrivateKey::from_fvk(&self.derive_internal()),
+            external: KeyAgreementPrivateKey::from_fvk(self, progress),
+            internal: KeyAgreementPrivateKey::from_fvk(&self.derive_internal(), progress),
         }
     }
 
@@ -454,6 +492,16 @@ impl FullViewingKey {
     ///
     /// [orchardrawfullviewingkeys]: https://zips.z.cash/protocol/protocol.pdf#orchardfullviewingkeyencoding
     pub fn from_bytes(bytes: &[u8; 96]) -> Option<Self> {
+        Self::from_bytes_with_progress(bytes, &mut || {})
+    }
+
+    /// [`FullViewingKey::from_bytes`], calling `progress` after each piece of its two
+    /// `Commit^ivk` Sinsemilla hashes (see
+    /// [`sinsemilla::HashDomain::hash_to_point_with_progress`]).
+    pub(crate) fn from_bytes_with_progress(
+        bytes: &[u8; 96],
+        progress: &mut dyn FnMut(),
+    ) -> Option<Self> {
         let ak = SpendValidatingKey::from_bytes(&bytes[..32])?;
         let nk = NullifierDerivingKey::from_bytes(&bytes[32..64])?;
         let rivk = CommitIvkRandomness::from_bytes(&bytes[64..])?;
@@ -461,9 +509,12 @@ impl FullViewingKey {
         let fvk = FullViewingKey { ak, nk, rivk };
 
         // If either ivk is 0 or ⊥, this FVK is invalid.
-        let _: NonZeroPallasBase = Option::from(KeyAgreementPrivateKey::derive_inner(&fvk))?;
         let _: NonZeroPallasBase =
-            Option::from(KeyAgreementPrivateKey::derive_inner(&fvk.derive_internal()))?;
+            Option::from(KeyAgreementPrivateKey::derive_inner(&fvk, progress))?;
+        let _: NonZeroPallasBase = Option::from(KeyAgreementPrivateKey::derive_inner(
+            &fvk.derive_internal(),
+            progress,
+        ))?;
 
         Some(fvk)
     }
@@ -633,9 +684,9 @@ impl KeyAgreementPrivateKey {
     /// Defined in [Zcash Protocol Spec § 4.2.3: Orchard Key Components][orchardkeycomponents].
     ///
     /// [orchardkeycomponents]: https://zips.z.cash/protocol/protocol.pdf#orchardkeycomponents
-    fn from_fvk(fvk: &FullViewingKey) -> Self {
+    fn from_fvk(fvk: &FullViewingKey, progress: &mut dyn FnMut()) -> Self {
         // FullViewingKey cannot be constructed such that this unwrap would fail.
-        let ivk = KeyAgreementPrivateKey::derive_inner(fvk).unwrap();
+        let ivk = KeyAgreementPrivateKey::derive_inner(fvk, progress).unwrap();
         KeyAgreementPrivateKey(ivk.into())
     }
 }
@@ -646,9 +697,12 @@ impl KeyAgreementPrivateKey {
     /// Defined in [Zcash Protocol Spec § 4.2.3: Orchard Key Components][orchardkeycomponents].
     ///
     /// [orchardkeycomponents]: https://zips.z.cash/protocol/protocol.pdf#orchardkeycomponents
-    fn derive_inner(fvk: &FullViewingKey) -> CtOption<NonZeroPallasBase> {
+    fn derive_inner(
+        fvk: &FullViewingKey,
+        progress: &mut dyn FnMut(),
+    ) -> CtOption<NonZeroPallasBase> {
         let ak = extract_p(&pallas::Point::from_bytes(&(&fvk.ak.0).into()).unwrap());
-        commit_ivk(&ak, &fvk.nk.0, &fvk.rivk.0)
+        commit_ivk(&ak, &fvk.nk.0, &fvk.rivk.0, progress)
             // sinsemilla::CommitDomain::short_commit returns a value in range
             // [0..q_P] ∪ {⊥}:
             // - sinsemilla::HashDomain::hash_to_point uses incomplete addition and
@@ -699,7 +753,7 @@ impl IncomingViewingKey {
     fn from_fvk(fvk: &FullViewingKey) -> Self {
         IncomingViewingKey {
             dk: fvk.derive_dk_ovk().0,
-            ivk: KeyAgreementPrivateKey::from_fvk(fvk),
+            ivk: KeyAgreementPrivateKey::from_fvk(fvk, &mut || {}),
         }
     }
 }

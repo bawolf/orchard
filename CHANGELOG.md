@@ -10,7 +10,17 @@ and this project adheres to Rust's notion of
 ### Added
 - `orchard::pczt::Spend::verify_nullifier_with_progress`, which runs
   `verify_nullifier_with_classifier` and calls a progress callback between its
-  three expensive steps, for signers on slow devices that must report progress.
+  three expensive steps and after each piece of their Sinsemilla hashes, for
+  signers on slow devices that must report progress.
+- Variants that call a progress callback after each piece of their Sinsemilla
+  hashes (see `sinsemilla::HashDomain::hash_to_point_with_progress`), for signers
+  on slow devices, where one hash with `sinsemilla/computed-generators` takes up
+  to ~0.7 s; results and checks are unchanged:
+  - `orchard::keys::SpendingKey::from_bytes_with_progress`
+  - `orchard::keys::FullViewingKey::{address_with_progress, scope_classifier_with_progress}`
+  - `orchard::note::Note::from_parts_with_progress`
+  - `orchard::pczt::Spend::parse_with_progress`
+  - `orchard::pczt::Output::verify_note_commitment_with_progress`
 
 ### Changed
 - `orchard::keys::FullViewingKey::scope_for_address` now reconstructs the candidate

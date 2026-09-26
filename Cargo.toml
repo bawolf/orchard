@@ -110,6 +110,11 @@ name = "circuit"
 harness = false
 required-features = ["circuit"]
 
+# The Sinsemilla progress callbacks (`hash_to_point_with_progress` and the
+# `commit` variants) are not in a sinsemilla release yet.
+[patch.crates-io]
+sinsemilla = { git = "https://github.com/bawolf/sinsemilla", rev = "6607cb019a587869a183b04172e20b4d2719a8e7" }
+
 [profile.release]
 debug = true
 

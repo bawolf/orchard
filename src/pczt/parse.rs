@@ -152,6 +152,46 @@ impl Spend {
         note_version: NoteVersion,
         proprietary: BTreeMap<String, Vec<u8>>,
     ) -> Result<Self, ParseError> {
+        Self::parse_with_progress(
+            nullifier,
+            rk,
+            spend_auth_sig,
+            recipient,
+            value,
+            rho,
+            rseed,
+            fvk,
+            witness,
+            alpha,
+            zip32_derivation,
+            dummy_sk,
+            note_version,
+            proprietary,
+            &mut || {},
+        )
+    }
+
+    /// [`Spend::parse`], calling `progress` after each piece of the Sinsemilla hashes
+    /// that validate `fvk` and `dummy_sk` (see
+    /// [`sinsemilla::HashDomain::hash_to_point_with_progress`]).
+    #[allow(clippy::too_many_arguments)]
+    pub fn parse_with_progress(
+        nullifier: [u8; 32],
+        rk: [u8; 32],
+        spend_auth_sig: Option<[u8; 64]>,
+        recipient: Option<[u8; 43]>,
+        value: Option<u64>,
+        rho: Option<[u8; 32]>,
+        rseed: Option<[u8; 32]>,
+        fvk: Option<[u8; 96]>,
+        witness: Option<(u32, [[u8; 32]; NOTE_COMMITMENT_TREE_DEPTH])>,
+        alpha: Option<[u8; 32]>,
+        zip32_derivation: Option<Zip32Derivation>,
+        dummy_sk: Option<[u8; 32]>,
+        note_version: NoteVersion,
+        proprietary: BTreeMap<String, Vec<u8>>,
+        progress: &mut dyn FnMut(),
+    ) -> Result<Self, ParseError> {
         Self::parse_inner(
             nullifier,
             rk,
@@ -168,6 +208,7 @@ impl Spend {
             note_version,
             proprietary,
             FvkHandling::Derive,
+            progress,
         )
     }
 
@@ -229,6 +270,7 @@ impl Spend {
             note_version,
             proprietary,
             FvkHandling::Skip,
+            &mut || {},
         )
     }
 
@@ -253,6 +295,7 @@ impl Spend {
         note_version: NoteVersion,
         proprietary: BTreeMap<String, Vec<u8>>,
         fvk_handling: FvkHandling,
+        progress: &mut dyn FnMut(),
     ) -> Result<Self, ParseError> {
         let nullifier = Nullifier::from_bytes(&nullifier)
             .into_option()
@@ -297,7 +340,8 @@ impl Spend {
             FvkHandling::Skip => None,
             FvkHandling::Derive => fvk
                 .map(|fvk| {
-                    FullViewingKey::from_bytes(&fvk).ok_or(ParseError::InvalidFullViewingKey)
+                    FullViewingKey::from_bytes_with_progress(&fvk, progress)
+                        .ok_or(ParseError::InvalidFullViewingKey)
                 })
                 .transpose()?,
         };
@@ -327,7 +371,7 @@ impl Spend {
 
         let dummy_sk = dummy_sk
             .map(|dummy_sk| {
-                SpendingKey::from_bytes(dummy_sk)
+                SpendingKey::from_bytes_with_progress(dummy_sk, progress)
                     .into_option()
                     .ok_or(ParseError::InvalidDummySpendingKey)
             })
