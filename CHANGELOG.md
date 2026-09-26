@@ -7,6 +7,11 @@ and this project adheres to Rust's notion of
 
 ## [Unreleased]
 
+### Added
+- `orchard::pczt::Spend::verify_nullifier_with_progress`, which runs
+  `verify_nullifier_with_classifier` and calls a progress callback between its
+  three expensive steps, for signers on slow devices that must report progress.
+
 ### Changed
 - `orchard::keys::FullViewingKey::scope_for_address` now reconstructs the candidate
   address directly from the address's diversifier for each scope instead of recovering

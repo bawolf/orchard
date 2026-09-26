@@ -127,6 +127,19 @@ impl super::Spend {
         expected_fvk: Option<&FullViewingKey>,
         classifier: Option<&ScopeClassifier>,
     ) -> Result<(), VerifyError> {
+        self.verify_nullifier_with_progress(expected_fvk, classifier, &mut || {})
+    }
+
+    /// [`Spend::verify_nullifier_with_classifier`], calling `progress` between its
+    /// three expensive steps (the spent note's commitment, the FVK-ownership check
+    /// and the nullifier derivation), for a caller on a slow device that must
+    /// report progress while it runs. The checks are unchanged.
+    pub fn verify_nullifier_with_progress(
+        &self,
+        expected_fvk: Option<&FullViewingKey>,
+        classifier: Option<&ScopeClassifier>,
+        progress: &mut dyn FnMut(),
+    ) -> Result<(), VerifyError> {
         let fvk = self.fvk_for_validation(expected_fvk)?;
 
         // DEDUP LEVER 1: derive the spend note commitment `cm_old` exactly once
@@ -140,6 +153,7 @@ impl super::Spend {
             self.note_version,
         )
         .ok_or(VerifyError::InvalidSpendNote)?;
+        progress();
 
         // We need both the note and the FVK to verify the nullifier; we have everything
         // needed to also verify that the correct FVK was provided (the nullifier check
@@ -154,6 +168,7 @@ impl super::Spend {
         if !owned {
             return Err(VerifyError::WrongFvkForNote);
         }
+        progress();
 
         if note.nullifier_with_commitment(fvk, &cm_old) == self.nullifier {
             Ok(())
